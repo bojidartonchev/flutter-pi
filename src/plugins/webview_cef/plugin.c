@@ -36,7 +36,8 @@ static int on_receive(char *channel, struct platch_obj *object, FlutterPlatformM
     method = object->method;
 
     WValue *encodeArgs = encode_stdvalue_to_wvalue(&object->std_arg);
-
+    (void) encodeArgs;
+    
     //TODO Forward to plugin
 
     return platch_respond_not_implemented(response_handle);
