@@ -4,160 +4,230 @@
 #include "util/logging.h"
 #include <iconv.h>
 
-static bool convert(char *buf, char *outbuf, size_t len, const char *from, const char *to)
+static bool convert(char *inbuf, char *outbuf, size_t len, const char *from, const char *to)
 {
-    iconv_t iconv_cd;
-    if ((iconv_cd = iconv_open(to, from)) == (iconv_t) -1) {
-        LOG_ERROR("Cannot open iconv from %s to %s\n", from, to);
+    iconv_t iconv_cd = iconv_open(to, from);
+    if (iconv_cd == (iconv_t) -1) {
+        LOG_ERROR("Conversion from charset \"%s\" to charset \"%s\" is not supported. iconv_open: %s\n", from, to, strerror(errno));
         return false;
     }
 
-    char *inbuf = buf;
     size_t inlen = len;
     size_t outlen = len;
     size_t res = 0;
 
     while (inlen > 0 && outlen > 0) {
         res = iconv(iconv_cd, &inbuf, &inlen, &outbuf, &outlen);
-        if (res == 0)
+        if (res == 0) {
             break;
-
-        if (res == (size_t) (-1))
-        {
-            if (errno != EILSEQ && errno != EINVAL)
-            {
-                iconv_close(iconv_cd);
-                *outbuf = '\0';
-
-                return true;
-            }
-            else if (inbuf < outbuf) {
-                iconv_close(iconv_cd);
-                *outbuf = '\0';
-
-                return true;
-            }
         }
 
-        if (inlen > 0 && outlen > 0) {
-            *outbuf++ = *inbuf++;
-            inlen--;
-            outlen--;
+        if (res == (size_t) (-1)) {
+            iconv_close(iconv_cd);
+            *outbuf = '\0';
+
+            return false;
         }
     }
 
     iconv_close(iconv_cd);
     *outbuf = '\0';
+
     return true;
 }
 
-static int on_encode(struct platch_obj *object, FlutterPlatformMessageResponseHandle *responseHandle) {
+static int on_encode(struct platch_obj *object, FlutterPlatformMessageResponseHandle *response_handle) {
     struct std_value *args, *tmp;
-    char *charset, *data;
+    char *charset, *input, *output;
 
     args = &object->std_arg;
 
     if (args == NULL || !STDVALUE_IS_MAP(*args)) {
-        return platch_respond_illegal_arg_std(responseHandle, "Expected `arg` to be a map.");
+        return platch_respond_illegal_arg_std(response_handle, "Expected `arg` to be a map.");
     }
 
     tmp = stdmap_get_str(&object->std_arg, "charset");
     if (tmp == NULL || !STDVALUE_IS_STRING(*tmp)) {
-        LOG_ERROR("Call missing mandatory parameter charset.\n");
-        return platch_respond_illegal_arg_std(responseHandle, "Expected `arg['charset'] to be a string.");
+        return platch_respond_illegal_arg_std(response_handle, "Expected `arg['charset'] to be a string.");
     }
 
     charset = STDVALUE_AS_STRING(*tmp);
 
     tmp = stdmap_get_str(&object->std_arg, "data");
     if (tmp == NULL || !STDVALUE_IS_STRING(*tmp)) {
-        LOG_ERROR("Call missing mandatory parameter data.\n");
-        return platch_respond_illegal_arg_std(responseHandle, "Expected `arg['data'] to be a string.");
+        return platch_respond_illegal_arg_std(response_handle, "Expected `arg['data'] to be a string.");
     }
 
-    data = STDVALUE_AS_STRING(*tmp);
+    input = STDVALUE_AS_STRING(*tmp);
+    output = malloc(strlen(input) + 1);
 
-    char* from = (char*) malloc(strlen(data) + 1);
-    char* to = (char*) malloc(strlen(data) + 1);
-    strcpy(from, data);
-
-    auto res = convert(from, to, strlen(from) + 1, "UTF-8", charset);
-    if(!res)
-    {
-        return platch_respond_error_std(responseHandle, "error_id", "charset_name_unrecognized", NULL);
+    bool res = convert(input, output, strlen(input) + 1, "UTF-8", charset);
+    if(!res) {
+        free(output);
+        return platch_respond_error_std(response_handle, "error_id", "charset_name_unrecognized", NULL);
     }
 
-    uint8_t* output;
-    output = (uint8_t*)malloc(strlen(to));
-
-    for(int i = 0; i < strlen(to); i++)
-    {
-        output[i] = (uint8_t)to[i];
-    }
-
-    return platch_respond(
-        responseHandle,
-        &(struct platch_obj){ .codec = kStandardMethodCallResponse, .success = true, .std_result = { .type = kStdUInt8Array, .uint8array = &output[0], .size = strlen(to) }, }
+    int ok = platch_respond_success_std(
+        response_handle,
+        &(struct std_value) {
+            .type = kStdUInt8Array,
+            .size = strlen(output),
+            .uint8array = (uint8_t*) output,
+        }
     );
+
+    free(output);
+
+    return ok;
 }
 
-static int on_available_charsets(struct platch_obj *object, FlutterPlatformMessageResponseHandle *responseHandle) {
-    auto list = (struct std_value[]){ { .type = kStdString, .string_value = "Not available for Linux." }};
+static int on_decode(struct platch_obj *object, FlutterPlatformMessageResponseHandle *response_handle) {
+    struct std_value *args, *tmp;
+    char *charset, *output;
+    const uint8_t *input;
 
-    return platch_respond(
-        responseHandle,
-        &(struct platch_obj){ .codec = kStandardMethodCallResponse, .success = true, .std_result = { .type = kStdList, .list = list, .size = 1 }, }
+    args = &object->std_arg;
+
+    if (args == NULL || !STDVALUE_IS_MAP(*args)) {
+        return platch_respond_illegal_arg_std(response_handle, "Expected `arg` to be a map.");
+    }
+
+    tmp = stdmap_get_str(&object->std_arg, "charset");
+    if (tmp == NULL || !STDVALUE_IS_STRING(*tmp)) {
+        return platch_respond_illegal_arg_std(response_handle, "Expected `arg['charset'] to be a string.");
+    }
+
+    charset = STDVALUE_AS_STRING(*tmp);
+
+    tmp = stdmap_get_str(&object->std_arg, "data");
+    if (tmp == NULL || (*tmp).type != kStdUInt8Array ) {
+        return platch_respond_illegal_arg_std(response_handle, "Expected `arg['data'] to be a uint8_t list.");
+    }
+
+    input = tmp->uint8array;
+    output = malloc(strlen((char*) input) + 1);
+
+    bool res = convert((char*) input, output, strlen((char*) input) + 1, "UTF-8", charset);
+    if(!res) {
+        free(output);
+        return platch_respond_error_std(response_handle, "error_id", "charset_name_unrecognized", NULL);
+    }
+
+    int ok = platch_respond_success_std(
+        response_handle,
+        &(struct std_value) {
+            .type = kStdUInt8Array,
+            .size = strlen(output),
+            .uint8array = (uint8_t*) output,
+        }
     );
+
+    free(output);
+
+    return ok;
 }
 
-static int on_check(struct platch_obj *object, FlutterPlatformMessageResponseHandle *responseHandle) {
+static int on_available_charsets(struct platch_obj *object, FlutterPlatformMessageResponseHandle *response_handle) {
+    (void) object;
+
+    char* output;
+    size_t length, count;
+    FILE *fp;
+
+    // Count the available charsets
+    fp = popen("iconv --list | wc -w", "r");
+    if(!fp) {
+        return platch_respond_error_std(response_handle, "error_id", "charsets_not_available", NULL);
+    }
+
+    while (getline(&output, &length, fp) >= 0) {
+        count = atoi(output);
+    }
+
+    pclose(fp);
+
+    fp = popen("iconv --list", "r");
+    if(!fp) {
+        return platch_respond_error_std(response_handle, "error_id", "charsets_not_available", NULL);
+    }
+
+    struct std_value values;
+
+    values.type = kStdList;
+    values.size = count;
+    values.list = alloca(sizeof(struct std_value) * count);
+
+    for (int index = 0; index < count; index++) {
+        if(getline(&output, &length, fp) < 0) {
+            break;
+        }
+
+        strtok(output, "/");
+
+        values.list[index].type = kStdString;
+        values.list[index].string_value = strdup(output);
+    }
+
+    pclose(fp);
+
+    return platch_respond_success_std(response_handle, &values);
+}
+
+static int on_check(struct platch_obj *object, FlutterPlatformMessageResponseHandle *response_handle) {
     struct std_value *args, *tmp;
     char *charset;
 
     args = &object->std_arg;
 
     if (args == NULL || !STDVALUE_IS_MAP(*args)) {
-        return platch_respond_illegal_arg_std(responseHandle, "Expected `arg` to be a map.");
+        return platch_respond_illegal_arg_std(response_handle, "Expected `arg` to be a map.");
     }
 
     tmp = stdmap_get_str(&object->std_arg, "charset");
     if (tmp == NULL || !STDVALUE_IS_STRING(*tmp)) {
-        LOG_ERROR("Call missing mandatory parameter charset.\n");
-        return platch_respond_illegal_arg_std(responseHandle, "Expected `arg['charset'] to be a string.");
+        return platch_respond_illegal_arg_std(response_handle, "Expected `arg['charset'] to be a string.");
     }
 
     charset = STDVALUE_AS_STRING(*tmp);
 
-    iconv_t iconv_cd;
-    if ((iconv_cd = iconv_open("UTF-8", charset)) == (iconv_t) -1) {
+    iconv_t iconv_cd = iconv_open("UTF-8", charset);
+    if (iconv_cd == (iconv_t) -1) {
         return platch_respond(
-            responseHandle,
+            response_handle,
             &(struct platch_obj){ .codec = kStandardMethodCallResponse, .success = true, .std_result = { .type = kStdFalse } }
         );
     }
 
+    iconv_close(iconv_cd);
+
     return platch_respond(
-        responseHandle,
+        response_handle,
         &(struct platch_obj){ .codec = kStandardMethodCallResponse, .success = true, .std_result = { .type = kStdTrue } }
     );
 }
 
-static int on_receive(char *channel, struct platch_obj *object, FlutterPlatformMessageResponseHandle *responseHandle) {
+static int on_receive(char *channel, struct platch_obj *object, FlutterPlatformMessageResponseHandle *response_handle) {
+    (void) channel;
+
     const char *method;
     method = object->method;
 
     if (streq(method, "encode")) {
-        return on_encode(object, responseHandle);
+        return on_encode(object, response_handle);
+    } else if (streq(method, "decode")) {
+        return on_decode(object, response_handle);
     } else if (streq(method, "availableCharsets")) {
-        return on_available_charsets(object, responseHandle);
+        return on_available_charsets(object, response_handle);
     } else if (streq(method, "check")) {
-        return on_check(object, responseHandle);
+        return on_check(object, response_handle);
     }
 
-    return platch_respond_not_implemented(responseHandle);
+    return platch_respond_not_implemented(response_handle);
 }
 
 enum plugin_init_result charset_converter_init(struct flutterpi *flutterpi, void **userdata_out) {
+    (void) flutterpi;
+
     int ok;
 
     ok = plugin_registry_set_receiver_locked(CHARSET_CONVERTER_CHANNEL, kStandardMethodCall, on_receive);
@@ -171,8 +241,9 @@ enum plugin_init_result charset_converter_init(struct flutterpi *flutterpi, void
 }
 
 void charset_converter_deinit(struct flutterpi *flutterpi, void *userdata) {
+    (void) userdata;
+
     plugin_registry_remove_receiver_v2_locked(flutterpi_get_plugin_registry(flutterpi), CHARSET_CONVERTER_CHANNEL);
-    return 0;
 }
 
 FLUTTERPI_PLUGIN("charset converter plugin", charset_converter_plugin, charset_converter_init, charset_converter_deinit)
