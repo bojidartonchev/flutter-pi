@@ -5,8 +5,6 @@
 #include "pluginregistry.h"
 #include "util/logging.h"
 #include "common/webview_plugin.h"
-#include "keyevent.h"
-#include "texture.h"
 
 static struct plugin {
     //pthread_mutex_t lock;
