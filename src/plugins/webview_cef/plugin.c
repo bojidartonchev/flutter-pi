@@ -16,12 +16,12 @@ static struct plugin {
 
 static WValue *encode_stdvalue_to_wvalue(struct std_value *args)
 {
-    if(STDVALUE_IS_BOOL(args)) {
-        return webview_value_new_bool(STDVALUE_AS_BOOL(args));
+    if(STDVALUE_IS_BOOL(*args)) {
+        return webview_value_new_bool(STDVALUE_AS_BOOL(*args));
     }
 
-    if(STDVALUE_IS_INT(args)) {
-        return webview_value_new_int(STDVALUE_AS_INT(args));
+    if(STDVALUE_IS_INT(*args)) {
+        return webview_value_new_int(STDVALUE_AS_INT(*args));
     }
 
     //TODO Handle everything
