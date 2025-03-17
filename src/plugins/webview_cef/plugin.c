@@ -4,29 +4,20 @@
 #include "flutter-pi.h"
 #include "pluginregistry.h"
 #include "util/logging.h"
-#include "common/webview_plugin.h"
 
-static struct plugin {
-    //pthread_mutex_t lock;
+static int on_init(struct platch_obj *object, FlutterPlatformMessageResponseHandle *response_handle) {
+    struct std_value *args;
+    char *userAgent;
 
-    struct flutterpi *flutterpi;
-    bool initialized;
-    //webview_cef::WebviewPlugin *webview;
-} plugin;
+    args = &object->std_arg;
 
-static WValue *encode_stdvalue_to_wvalue(struct std_value *args)
-{
-    if(STDVALUE_IS_BOOL(*args)) {
-        return webview_value_new_bool(STDVALUE_AS_BOOL(*args));
+    if (args != NULL && STDVALUE_IS_STRING(*args)) {
+        userAgent = STDVALUE_AS_STRING(*args);
     }
 
-    if(STDVALUE_IS_INT(*args)) {
-        return webview_value_new_int(STDVALUE_AS_INT(*args));
-    }
+    int ok = platch_respond_success_std(response_handle, &STDINT32(1));
 
-    //TODO Handle everything
-
-    return webview_value_new_null();
+    return ok;
 }
 
 static int on_receive(char *channel, struct platch_obj *object, FlutterPlatformMessageResponseHandle *response_handle) {
@@ -35,12 +26,9 @@ static int on_receive(char *channel, struct platch_obj *object, FlutterPlatformM
     const char *method;
     method = object->method;
 
-    WValue *encodeArgs = encode_stdvalue_to_wvalue(&object->std_arg);
-    //TODO Delete these
-    (void) encodeArgs;
-    (void) method;
-
-    //TODO Forward to plugin
+    if (streq(method, "init")) {
+        return on_init(object, response_handle);
+    }
 
     return platch_respond_not_implemented(response_handle);
 }
@@ -57,12 +45,6 @@ enum plugin_init_result webview_cef_init(struct flutterpi *flutterpi, void **use
 
     *userdata_out = NULL;
 
-    plugin.flutterpi = flutterpi;
-    plugin.initialized = false;
-    //plugin.webview = new webview_cef::WebviewPlugin();
-
-    //TODO Initialize
-
     return PLUGIN_INIT_RESULT_INITIALIZED;
 }
 
@@ -70,11 +52,6 @@ void webview_cef_deinit(struct flutterpi *flutterpi, void *userdata) {
     (void) userdata;
 
     plugin_registry_remove_receiver_v2_locked(flutterpi_get_plugin_registry(flutterpi), WEBVIEW_CEF_CHANNEL);
-
-    //TODO Destroy
-    //if(plugin.webview) {
-    //    free(plugin.webview);
-    //}
 }
 
 FLUTTERPI_PLUGIN("webview cef plugin", webview_cef_plugin, webview_cef_init, webview_cef_deinit)

@@ -354,8 +354,6 @@ endif()
 if (BUILD_WEBVIEW_CEF_PLUGIN)
   target_sources(flutterpi_module PRIVATE
       src/plugins/webview_cef/plugin.c
-      src/plugins/webview_cef/common/webview_value.c
-      src/plugins/webview_cef/common/webview_plugin.c
   )
 endif()
 
