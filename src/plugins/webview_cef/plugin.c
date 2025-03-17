@@ -15,6 +15,10 @@ static int on_init(struct platch_obj *object, FlutterPlatformMessageResponseHand
         userAgent = STDVALUE_AS_STRING(*args);
     }
 
+    if(userAgent) {
+        LOG_ERROR("Imame userAgent: %s\n", userAgent);
+    }
+
     int ok = platch_respond_success_std(response_handle, &STDINT32(1));
 
     return ok;
