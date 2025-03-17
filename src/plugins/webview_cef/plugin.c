@@ -7,6 +7,25 @@
 
 static int on_init(struct platch_obj *object, FlutterPlatformMessageResponseHandle *response_handle) {
     struct std_value *args;
+    char *url;
+
+    args = &object->std_arg;
+
+    if (args == NULL || !STDVALUE_IS_STRING(*args)) {
+        return platch_respond_illegal_arg_std(response_handle, "Expected `url` to be a string.");
+    }
+
+    url = STDVALUE_AS_STRING(*args);
+
+    LOG_ERROR("Imame url: %s\n", url);
+
+    int ok = platch_respond_success_std(response_handle, &STDINT32(1));
+
+    return ok;
+}
+
+static int on_create(struct platch_obj *object, FlutterPlatformMessageResponseHandle *response_handle) {
+    struct std_value *args;
     char *userAgent;
 
     args = &object->std_arg;
@@ -32,6 +51,8 @@ static int on_receive(char *channel, struct platch_obj *object, FlutterPlatformM
 
     if (streq(method, "init")) {
         return on_init(object, response_handle);
+    } else if (streq(method, "create")) {
+        return on_create(object, response_handle);
     }
 
     return platch_respond_not_implemented(response_handle);
