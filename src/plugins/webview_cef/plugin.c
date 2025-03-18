@@ -19,7 +19,7 @@ static int on_init(struct platch_obj *object, FlutterPlatformMessageResponseHand
         LOG_ERROR("Imame userAgent: %s\n", userAgent);
     }
 
-    int ok = platch_respond_success_std(response_handle, &STDINT32(1));
+    int ok = platch_respond_success_std(response_handle, &STDNULL);
 
     return ok;
 }
@@ -37,6 +37,18 @@ static int on_create(struct platch_obj *object, FlutterPlatformMessageResponseHa
     url = STDVALUE_AS_STRING(*args);
 
     LOG_ERROR("Imame url: %s\n", url);
+
+    struct std_value response;
+
+    response.type = kStdList;
+    response.size = 2;
+    response.list = alloca(sizeof(struct std_value) * response.size);
+
+    response.list[0].type = kStdInt32;
+    response.list[0].int32_value = 1;
+
+    response.list[1].type = kStdInt32;
+    response.list[1].int32_value = 1;
 
     int ok = platch_respond_success_std(response_handle, &STDINT32(1));
 
