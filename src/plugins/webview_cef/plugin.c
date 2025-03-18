@@ -44,8 +44,8 @@ static int on_create(struct platch_obj *object, FlutterPlatformMessageResponseHa
 
     cef_browser_settings_t browser_settings = {};
     cef_string_t url2;
-    const wchar_t* url3 = L"https://www.google.com"; 
-    cef_string_utf16_set(url3, wcslen(L"https://www.google.com"), &url2, 1);
+    const char16_t* url3 = u"https://www.google.com";  // The URL as a char16_t string (UTF-16)
+    cef_string_utf16_set(url3, u16strlen(url3), &url2, 1);  // Set the cef_string_t with the URL
 
     cef_browser_host_create_browser(&window_info, NULL, &url2, &browser_settings, NULL, NULL);
 
