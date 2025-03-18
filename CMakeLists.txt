@@ -352,6 +352,13 @@ if (BUILD_CHARSET_CONVERTER_PLUGIN)
 endif()
 
 if (BUILD_WEBVIEW_CEF_PLUGIN)
+  find_path(CEF_INCLUDE_DIR NAMES include/capi/cef_app_capi.h PATHS /usr/include/cef)
+  find_library(CEF_LIB NAMES libcef.so PATHS /usr/lib)
+
+  add_library(myapp main.cpp)
+  target_include_directories(flutterpi_module PUBLIC ${CEF_INCLUDE_DIR})
+  target_link_libraries(flutterpi_module PUBLIC ${CEF_LIB})
+
   target_sources(flutterpi_module PRIVATE
       src/plugins/webview_cef/plugin.c
   )

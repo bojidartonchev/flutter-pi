@@ -5,6 +5,9 @@
 #include "pluginregistry.h"
 #include "util/logging.h"
 
+#include "cef_browser_capi.h"
+#include "cef_client_capi.h"
+
 static int on_init(struct platch_obj *object, FlutterPlatformMessageResponseHandle *response_handle) {
     struct std_value *args;
     char *userAgent;
@@ -55,6 +58,14 @@ static int on_create(struct platch_obj *object, FlutterPlatformMessageResponseHa
     return ok;
 }
 
+static int on_set_client_focus(struct platch_obj *object, FlutterPlatformMessageResponseHandle *response_handle) {
+    (void) object;
+
+    int ok = platch_respond_success_std(response_handle, &STDNULL);
+
+    return ok;
+}
+
 static int on_receive(char *channel, struct platch_obj *object, FlutterPlatformMessageResponseHandle *response_handle) {
     (void) channel;
 
@@ -65,6 +76,8 @@ static int on_receive(char *channel, struct platch_obj *object, FlutterPlatformM
         return on_init(object, response_handle);
     } else if (streq(method, "create")) {
         return on_create(object, response_handle);
+    } else if (streq(method, "setClientFocus")) {
+        return on_set_client_focus(object, response_handle);
     }
 
     return platch_respond_not_implemented(response_handle);
