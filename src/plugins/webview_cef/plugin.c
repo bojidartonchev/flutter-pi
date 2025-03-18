@@ -41,11 +41,6 @@ static int on_create(struct platch_obj *object, FlutterPlatformMessageResponseHa
     LOG_ERROR("Imame url: %s\n", url);
 
     cef_window_info_t window_info = {};
-    window_info.style = 0;
-    window_info.x = 0;
-    window_info.y = 0;
-    window_info.width = 800;
-    window_info.height = 600;
 
     cef_browser_settings_t browser_settings = {};
     cef_string_t url2;
