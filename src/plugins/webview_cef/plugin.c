@@ -4,7 +4,6 @@
 #include "flutter-pi.h"
 #include "pluginregistry.h"
 #include "util/logging.h"
-#include <windows.h>
 #include "capi/cef_browser_capi.h"
 #include "capi/cef_client_capi.h"
 
@@ -47,7 +46,7 @@ static int on_create(struct platch_obj *object, FlutterPlatformMessageResponseHa
     window_info.y = 0;
     window_info.width = 800;
     window_info.height = 600;
-    
+
     cef_browser_settings_t browser_settings = {};
     cef_string_t url2;
     cef_string_utf16_set(L"https://www.google.com", 0, &url2, 1);
