@@ -41,6 +41,15 @@ static int on_create(struct platch_obj *object, FlutterPlatformMessageResponseHa
 
     LOG_ERROR("Imame url: %s\n", url);
 
+    cef_window_info_t window_info = {};
+    window_info.style = WS_OVERLAPPEDWINDOW;
+    
+    cef_browser_settings_t browser_settings = {};
+    cef_string_t url;
+    cef_string_utf16_set(L"https://www.google.com", 0, &url, 1);
+
+    cef_browser_host_create_browser(&window_info, NULL, &url, &browser_settings, NULL, NULL);
+
     struct std_value response;
 
     response.type = kStdList;
