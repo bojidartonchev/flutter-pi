@@ -352,9 +352,9 @@ if (BUILD_CHARSET_CONVERTER_PLUGIN)
 endif()
 
 if (BUILD_WEBVIEW_CEF_PLUGIN)
-  #set(CEF_INCLUDE_DIR ${CMAKE_SYSROOT}/usr/include/cef)
+  set(CEF_INCLUDE_DIR ${CMAKE_SYSROOT}/usr/)
 
-  #target_include_directories(flutterpi_module PUBLIC ${CEF_INCLUDE_DIR})
+  target_include_directories(flutterpi_module PUBLIC ${CEF_INCLUDE_DIR})
 
   target_sources(flutterpi_module PRIVATE
       src/plugins/webview_cef/plugin.c
