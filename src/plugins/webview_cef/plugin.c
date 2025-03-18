@@ -45,10 +45,10 @@ static int on_create(struct platch_obj *object, FlutterPlatformMessageResponseHa
     window_info.style = WS_OVERLAPPEDWINDOW;
     
     cef_browser_settings_t browser_settings = {};
-    cef_string_t url;
-    cef_string_utf16_set(L"https://www.google.com", 0, &url, 1);
+    cef_string_t url2;
+    cef_string_utf16_set(L"https://www.google.com", 0, &url2, 1);
 
-    cef_browser_host_create_browser(&window_info, NULL, &url, &browser_settings, NULL, NULL);
+    cef_browser_host_create_browser(&window_info, NULL, &url2, &browser_settings, NULL, NULL);
 
     struct std_value response;
 
