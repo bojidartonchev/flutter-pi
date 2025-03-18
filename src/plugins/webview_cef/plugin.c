@@ -50,7 +50,7 @@ static int on_create(struct platch_obj *object, FlutterPlatformMessageResponseHa
     response.list[1].type = kStdInt32;
     response.list[1].int32_value = 1;
 
-    int ok = platch_respond_success_std(response_handle, &STDINT32(1));
+    int ok = platch_respond_success_std(response_handle, &response);
 
     return ok;
 }
