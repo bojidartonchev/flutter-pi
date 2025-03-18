@@ -7,6 +7,14 @@
 #include "capi/cef_browser_capi.h"
 #include "capi/cef_client_capi.h"
 
+size_t u16strlen(const char16_t* str) {
+    size_t len = 0;
+    while (str[len] != 0) {  // Count until null terminator
+        len++;
+    }
+    return len;
+}
+
 static int on_init(struct platch_obj *object, FlutterPlatformMessageResponseHandle *response_handle) {
     struct std_value *args;
     char *userAgent;
@@ -44,8 +52,8 @@ static int on_create(struct platch_obj *object, FlutterPlatformMessageResponseHa
 
     cef_browser_settings_t browser_settings = {};
     cef_string_t url2;
-    const char16_t* url3 = u"https://www.google.com";  // The URL as a char16_t string (UTF-16)
-    cef_string_utf16_set(url3, strlen(url3), &url2, 1);  // Set the cef_string_t with the URL
+    const char16_t* url3 = u"https://www.google.com";
+    cef_string_utf16_set(url3, u16strlen(url3), &url2, 1);  // Set the cef_string_t with the URL
 
     cef_browser_host_create_browser(&window_info, NULL, &url2, &browser_settings, NULL, NULL);
 
