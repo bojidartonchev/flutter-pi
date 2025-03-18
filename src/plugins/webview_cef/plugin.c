@@ -6,6 +6,7 @@
 #include "util/logging.h"
 #include "capi/cef_browser_capi.h"
 #include "capi/cef_client_capi.h"
+#include "cef_string_types.h"
 
 size_t u16strlen(const char16_t* str) {
     size_t len = 0;
