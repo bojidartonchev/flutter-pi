@@ -5,8 +5,8 @@
 #include "pluginregistry.h"
 #include "util/logging.h"
 
-#include "cef_browser_capi.h"
-#include "cef_client_capi.h"
+#include "capi/cef_browser_capi.h"
+#include "capi/cef_client_capi.h"
 
 static int on_init(struct platch_obj *object, FlutterPlatformMessageResponseHandle *response_handle) {
     struct std_value *args;
