@@ -4,9 +4,9 @@
 #include "flutter-pi.h"
 #include "pluginregistry.h"
 #include "util/logging.h"
-#include "capi/cef_browser_capi.h"
-#include "capi/cef_client_capi.h"
-#include "internal/cef_string.h"
+#include "capi/cef_base.h"
+#include "capi/cef_app.h"
+#include "capi/cef_client.h"
 
 size_t u16strlen(const char16_t* str) {
     size_t len = 0;
@@ -48,6 +48,24 @@ static int on_create(struct platch_obj *object, FlutterPlatformMessageResponseHa
     url = STDVALUE_AS_STRING(*args);
 
     LOG_ERROR("Imame url: %s\n", url);
+
+    //char url[] = "https://www.google.com";
+    cef_string_t cef_url = {};
+    cef_string_utf8_to_utf16(url, strlen(url), &cef_url);
+    
+    // Browser settings. It is mandatory to set the
+    // "size" member.
+    cef_browser_settings_t browser_settings = {};
+    browser_settings.size = sizeof(cef_browser_settings_t);
+    
+    // Client handler and its callbacks
+    cef_client_t client = {};
+    initialize_cef_client(&client);
+
+    // Create browser asynchronously. There is also a
+    // synchronous version of this function available.
+    cef_browser_host_create_browser(&window_info, &client, &cef_url,
+                                    &browser_settings, NULL);
 
     /*cef_window_info_t window_info = {};
 
