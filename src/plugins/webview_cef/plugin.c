@@ -50,6 +50,18 @@ static int on_create(struct platch_obj *object, FlutterPlatformMessageResponseHa
 
     LOG_ERROR("Imame url: %s\n", url);
 
+    cef_settings_t settings = {};
+    settings.size = sizeof(cef_settings_t);
+
+    // Enable verbose logging
+    settings.log_severity = LOGSEVERITY_VERBOSE;
+
+    // Set log file path (optional)
+    cef_string_utf16_set(L"cef_debug.log", 13, &settings.log_file, 1);
+
+    // Initialize CEF
+    cef_initialize(NULL, &settings, NULL, NULL);
+
     cef_window_info_t window_info = {};
 
     //char url[] = "https://www.google.com";
