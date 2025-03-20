@@ -50,7 +50,7 @@ static int on_create(struct platch_obj *object, FlutterPlatformMessageResponseHa
     LOG_ERROR("Imame url: %s\n", url);
 
     cef_window_info_t window_info = {};
-    
+
     //char url[] = "https://www.google.com";
     cef_string_t cef_url = {};
     cef_string_utf8_to_utf16(url, strlen(url), &cef_url);
@@ -61,12 +61,12 @@ static int on_create(struct platch_obj *object, FlutterPlatformMessageResponseHa
     browser_settings.size = sizeof(cef_browser_settings_t);
     
     // Client handler and its callbacks
-    cef_client_t client = {};
-    initialize_cef_client(&client);
+    //cef_client_t client = {};
+    //initialize_cef_client(&client);
 
     // Create browser asynchronously. There is also a
     // synchronous version of this function available.
-    cef_browser_host_create_browser(&window_info, &client, &cef_url,
+    cef_browser_host_create_browser(&window_info, NULL, &cef_url,
                                     &browser_settings, NULL, NULL);
 
     /*cef_window_info_t window_info = {};
