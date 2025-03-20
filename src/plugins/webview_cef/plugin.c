@@ -70,7 +70,7 @@ static int on_create(struct platch_obj *object, FlutterPlatformMessageResponseHa
     cef_browser_t* browser = cef_browser_host_create_browser_sync(&window_info, NULL, &cef_url,
                                     &browser_settings, NULL, NULL);
 
-    int browser_id = browser->get_identifier(browser);
+    int browser_id = browser->get_identifier;
     LOG_ERROR("Browser id: %d\n", browser_id);
 
     /*cef_window_info_t window_info = {};
