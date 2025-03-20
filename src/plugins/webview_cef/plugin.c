@@ -4,9 +4,9 @@
 #include "flutter-pi.h"
 #include "pluginregistry.h"
 #include "util/logging.h"
-#include "capi/cef_base.h"
-#include "capi/cef_app.h"
-#include "capi/cef_client.h"
+#include "capi/cef_base_capi.h"
+#include "capi/cef_app_capi.h"
+#include "capi/cef_client_capi.h"
 
 size_t u16strlen(const char16_t* str) {
     size_t len = 0;
@@ -65,7 +65,7 @@ static int on_create(struct platch_obj *object, FlutterPlatformMessageResponseHa
     // Create browser asynchronously. There is also a
     // synchronous version of this function available.
     cef_browser_host_create_browser(&window_info, &client, &cef_url,
-                                    &browser_settings, NULL);
+                                    &browser_settings, NULL, NULL);
 
     /*cef_window_info_t window_info = {};
 
