@@ -49,14 +49,14 @@ static int on_create(struct platch_obj *object, FlutterPlatformMessageResponseHa
 
     LOG_ERROR("Imame url: %s\n", url);
 
-    cef_window_info_t window_info = {};
+    /*cef_window_info_t window_info = {};
 
     cef_browser_settings_t browser_settings = {};
     cef_string_t url2;
     const char16_t* url3 = u"https://www.google.com";
     cef_string_utf16_set(url3, u16strlen(url3), &url2, 1);  // Set the cef_string_t with the URL
 
-    cef_browser_host_create_browser(&window_info, NULL, &url2, &browser_settings, NULL, NULL);
+    cef_browser_host_create_browser(&window_info, NULL, &url2, &browser_settings, NULL, NULL);*/
 
     struct std_value response;
 
