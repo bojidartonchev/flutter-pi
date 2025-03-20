@@ -56,9 +56,6 @@ static int on_create(struct platch_obj *object, FlutterPlatformMessageResponseHa
     // Enable verbose logging
     settings.log_severity = LOGSEVERITY_VERBOSE;
 
-    // Set log file path (optional)
-    cef_string_utf16_set(L"cef_debug.log", 13, &settings.log_file, 1);
-
     // Initialize CEF
     cef_initialize(NULL, &settings, NULL, NULL);
 
