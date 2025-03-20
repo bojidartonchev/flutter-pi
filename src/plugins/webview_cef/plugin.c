@@ -49,6 +49,8 @@ static int on_create(struct platch_obj *object, FlutterPlatformMessageResponseHa
 
     LOG_ERROR("Imame url: %s\n", url);
 
+    cef_window_info_t window_info = {};
+    
     //char url[] = "https://www.google.com";
     cef_string_t cef_url = {};
     cef_string_utf8_to_utf16(url, strlen(url), &cef_url);
