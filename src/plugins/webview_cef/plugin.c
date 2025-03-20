@@ -7,6 +7,7 @@
 #include "capi/cef_base_capi.h"
 #include "capi/cef_app_capi.h"
 #include "capi/cef_client_capi.h"
+#include "internal/cef_string.h"
 
 size_t u16strlen(const char16_t* str) {
     size_t len = 0;
