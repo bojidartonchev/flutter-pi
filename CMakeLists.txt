@@ -352,13 +352,13 @@ if (BUILD_CHARSET_CONVERTER_PLUGIN)
 endif()
 
 if (BUILD_WEBVIEW_CEF_PLUGIN)
-  pkg_check_modules(NSS REQUIRED nss)
-  pkg_check_modules(NSPR REQUIRED nspr)
-  pkg_check_modules(CUPS REQUIRED cups)
 
   link_directories(${NSS_LIBRARY_DIRS} ${NSPR_LIBRARY_DIRS} ${CUPS_LIBRARY_DIRS})
 
   find_library(CEF_LIBRARY NAMES cef PATHS ${CMAKE_SYSROOT}/usr/lib/)
+  find_library(NSS_LIBRARY NAMES nss PATHS ${CMAKE_SYSROOT}/usr/lib/)
+  find_library(NSPR_LIBRARY NAMES nspr PATHS ${CMAKE_SYSROOT}/usr/lib/)
+  find_library(CUPS_LIBRARY NAMES cups PATHS ${CMAKE_SYSROOT}/usr/lib/)
 
   set(CEF_INCLUDE_DIR ${CMAKE_SYSROOT}/usr/)
 
@@ -368,7 +368,7 @@ if (BUILD_WEBVIEW_CEF_PLUGIN)
 
   target_include_directories(flutterpi_module PUBLIC ${CEF_INCLUDE_DIR})
 
-  target_link_libraries(flutterpi_module PUBLIC ${NSS_LIBRARIES} ${NSPR_LIBRARIES} ${CUPS_LIBRARIES})
+  target_link_libraries(flutterpi_module PUBLIC ${NSS_LIBRARY} ${NSPR_LIBRARY} ${CUPS_LIBRARY})
 
   target_sources(flutterpi_module PRIVATE
       src/plugins/webview_cef/plugin.c
