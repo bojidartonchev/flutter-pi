@@ -50,6 +50,8 @@ static int on_create(struct platch_obj *object, FlutterPlatformMessageResponseHa
 
     LOG_ERROR("Imame url: %s\n", url);
 
+    cef_main_args_t main_args = {};
+    
     cef_settings_t settings = {};
     settings.size = sizeof(cef_settings_t);
 
@@ -57,7 +59,7 @@ static int on_create(struct platch_obj *object, FlutterPlatformMessageResponseHa
     settings.log_severity = LOGSEVERITY_VERBOSE;
 
     // Initialize CEF
-    cef_initialize(NULL, &settings, NULL, NULL);
+    cef_initialize(&main_args, &settings, NULL, NULL);
 
     cef_window_info_t window_info = {};
 
