@@ -352,13 +352,21 @@ if (BUILD_CHARSET_CONVERTER_PLUGIN)
 endif()
 
 if (BUILD_WEBVIEW_CEF_PLUGIN)
+  find_library(CEF_LIBRARY NAMES cef PATHS ${CMAKE_SYSROOT}/usr/lib/)
+
   set(CEF_INCLUDE_DIR ${CMAKE_SYSROOT}/usr/)
+
+  if(NOT CEF_INCLUDE_DIR OR NOT CEF_LIBRARY)
+    message(FATAL_ERROR "CEF not found! Install CEF first.")
+  endif()
 
   target_include_directories(flutterpi_module PUBLIC ${CEF_INCLUDE_DIR})
 
   target_sources(flutterpi_module PRIVATE
       src/plugins/webview_cef/plugin.c
   )
+
+  target_link_libraries(flutterpi_module PUBLIC ${CEF_LIBRARY})
 endif()
 
 # Needed so dart VM can actually resolve symbols in the same
