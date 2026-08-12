@@ -41,6 +41,21 @@ The pump itself is driven from flutter-pi's `sd_event` loop:
 `CefDoMessageLoopWork()`. That callback is the one thing CEF may invoke from
 another thread, so it is the only place with a mutex.
 
+Honouring that callback is not enough on its own. It is a request for a pump, not
+a promise that CEF will ask again, so a pump driven purely by requests can run
+out of them and stop -- and then CEF's UI thread is stopped for good. The failure
+is a confusing one, because nothing looks broken: the network stack and the
+render processes are on other threads and in other processes, so a page still
+loads and its JavaScript still runs. It simply never paints again after whatever
+frame was already in flight, until an unrelated event (a mouse move, a resize)
+happens to schedule a pump and one more frame slips out.
+
+So the pump also keeps its own heartbeat, at the configured
+`windowless_frame_rate`, for as long as a browser exists that could paint, and
+clamps requested delays to the same interval. CEF's reference implementation
+(`MainMessageLoopExternalPump` in cefclient) clamps its timer for the same
+reason.
+
 ### Processes
 
 Chromium is multi-process, and on Linux it starts subprocesses by re-executing a
@@ -104,6 +119,7 @@ up, since none of it needs a recompile.
 | `FLUTTERPI_CEF_FRAME_RATE` | `windowless_frame_rate`, 1..60 (default 30) |
 | `FLUTTERPI_CEF_EAGER_INIT` | if set, start CEF during plugin init instead of on the first `init`/`create` |
 | `FLUTTERPI_CEF_TRACE` | if set, log browser creation, `setSize` and the frames arriving from CEF |
+| `FLUTTERPI_CEF_FORCE_RGBA` | if set, convert frames to RGBA on the CPU instead of uploading BGRA directly |
 
 `FLUTTERPI_CEF_TRACE` answers the first question a blank webview raises: is CEF
 painting at all, and at what size? It prints the first three frames per browser

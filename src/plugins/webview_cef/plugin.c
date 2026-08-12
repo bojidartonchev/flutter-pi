@@ -62,6 +62,11 @@
 #define MAX_SWITCHES 64
 #define DEFAULT_FRAME_RATE 30
 
+/// Bounds for the pump heartbeat, in frames per second. CEF clamps
+/// `windowless_frame_rate` to the same range.
+#define MIN_FRAME_RATE 1
+#define MAX_FRAME_RATE 60
+
 /// Traces the browser and frame lifecycle when FLUTTERPI_CEF_TRACE is set.
 ///
 /// Deliberately not LOG_DEBUG: that is compiled out unless flutter-pi itself was
@@ -133,6 +138,19 @@ struct webview_cef_plugin {
     bool pump_scheduled;
     uint64_t pump_deadline_us;
 
+    /// The longest we let the CEF message pump idle while a browser is alive,
+    /// derived from the configured frame rate.
+    ///
+    /// `OnScheduleMessagePumpWork` is a request, not a promise that CEF will ask
+    /// again: once a pump runs and CEF asks for nothing further, a pump that only
+    /// ever runs when asked has no way back and CEF's UI thread stops for good.
+    /// Everything off that thread -- networking, the render processes -- keeps
+    /// going, so a page still loads and runs; it just never paints again after
+    /// the frame that was already in flight, until something like a mouse event
+    /// happens to kick the pump. CEF's own reference pump (cefclient's
+    /// MainMessageLoopExternalPump) clamps its timer for the same reason.
+    int64_t pump_max_delay_ms;
+
     struct webview *webviews;
 };
 
@@ -179,6 +197,20 @@ static long resolve_env_long(const char *env_name, long fallback) {
     }
 
     return value;
+}
+
+/// `windowless_frame_rate` for new browsers, and the rate the pump heartbeat has
+/// to keep up with so it never becomes the thing limiting the frame rate.
+static long resolve_frame_rate(void) {
+    long frame_rate = resolve_env_long("FLUTTERPI_CEF_FRAME_RATE", DEFAULT_FRAME_RATE);
+
+    if (frame_rate < MIN_FRAME_RATE) {
+        return MIN_FRAME_RATE;
+    }
+    if (frame_rate > MAX_FRAME_RATE) {
+        return MAX_FRAME_RATE;
+    }
+    return frame_rate;
 }
 
 /// The webview_cef dart side passes arguments as a positional list, or as a bare
@@ -287,14 +319,32 @@ static void webview_release_textures(struct webview *wv) {
 // CEF message pump, driven from flutter-pi's event loop
 // ---------------------------------------------------------------------------
 
+static void on_schedule_pump_work(void *userdata, int64_t delay_ms);
+
 static int on_pump_message_loop(void *userdata) {
+    bool rearm;
+
     (void) userdata;
 
+    // Cleared before the pump, not after: CEF calls OnScheduleMessagePumpWork
+    // from inside CefDoMessageLoopWork, and that request has to be able to queue
+    // the next pump rather than being coalesced away into this one.
     pthread_mutex_lock(&plugin.pump_mutex);
     plugin.pump_scheduled = false;
     pthread_mutex_unlock(&plugin.pump_mutex);
 
     wvcef_do_message_loop_work();
+
+    pthread_mutex_lock(&plugin.pump_mutex);
+    rearm = !plugin.pump_scheduled;
+    pthread_mutex_unlock(&plugin.pump_mutex);
+
+    // Nothing asked for the next pump, so keep the heartbeat going ourselves for
+    // as long as there is a browser that could still paint. See pump_max_delay_ms.
+    if (rearm && wvcef_n_live_browsers() > 0) {
+        on_schedule_pump_work(NULL, plugin.pump_max_delay_ms);
+    }
+
     return 0;
 }
 
@@ -307,6 +357,8 @@ static void on_schedule_pump_work(void *userdata, int64_t delay_ms) {
 
     if (delay_ms < 0) {
         delay_ms = 0;
+    } else if (delay_ms > plugin.pump_max_delay_ms) {
+        delay_ms = plugin.pump_max_delay_ms;
     }
 
     deadline_us = now_monotonic_us() + (uint64_t) delay_ms * 1000ull;
@@ -771,7 +823,7 @@ static int on_create(struct std_value *args, FlutterPlatformMessageResponseHandl
         url = STDVALUE_AS_STRING(*args);
     }
 
-    frame_rate = resolve_env_long("FLUTTERPI_CEF_FRAME_RATE", DEFAULT_FRAME_RATE);
+    frame_rate = resolve_frame_rate();
 
     wv = calloc(1, sizeof *wv);
     if (wv == NULL) {
@@ -1191,7 +1243,16 @@ enum plugin_init_result webview_cef_init(struct flutterpi *flutterpi, void **use
     plugin.egl_display = display;
     plugin.egl_context = context;
     plugin.trace = getenv("FLUTTERPI_CEF_TRACE") != NULL;
-    plugin.supports_bgra = gl_renderer_supports_gl_extension(renderer, "GL_EXT_texture_format_BGRA8888");
+    plugin.pump_max_delay_ms = 1000 / resolve_frame_rate();
+
+    // The BGRA path uploads with GL_BGRA_EXT as the internal format, but the
+    // frame is handed to the engine as GL_RGBA8_OES, which is what every other
+    // texture source in flutter-pi reports. If a driver's Skia backend refuses
+    // that combination the webview goes silently blank -- no GL error, nothing
+    // in the log -- so keep a way to fall back to the CPU conversion in place
+    // rather than having to rebuild to find out.
+    plugin.supports_bgra = gl_renderer_supports_gl_extension(renderer, "GL_EXT_texture_format_BGRA8888") &&
+                           getenv("FLUTTERPI_CEF_FORCE_RGBA") == NULL;
 
     TRACE("plugin up. BGRA textures: %s\n", plugin.supports_bgra ? "yes" : "no, converting on the CPU");
 
