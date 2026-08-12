@@ -23,6 +23,7 @@
 #include <inttypes.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -61,6 +62,18 @@
 #define MAX_SWITCHES 64
 #define DEFAULT_FRAME_RATE 30
 
+/// Traces the browser and frame lifecycle when FLUTTERPI_CEF_TRACE is set.
+///
+/// Deliberately not LOG_DEBUG: that is compiled out unless flutter-pi itself was
+/// built with DEBUG, and a webview that comes up blank is something you have to
+/// explain on a release image, in place, without a rebuild.
+#define TRACE(...)                                         \
+    do {                                                   \
+        if (plugin.trace) {                                \
+            fprintf(stderr, "[webview_cef] " __VA_ARGS__); \
+        }                                                  \
+    } while (0)
+
 /// Chromium switches we pass unless FLUTTERPI_CEF_NO_DEFAULT_SWITCHES is set.
 /// The important ones are the first three: flutter-pi owns the DRM master and
 /// there is no X server or wayland compositor to talk to, so Chromium has to use
@@ -97,6 +110,9 @@ struct webview {
     uint8_t *swizzle_buffer;
     size_t swizzle_buffer_size;
 
+    /// Frames CEF has handed us, for TRACE only.
+    uint64_t n_frames;
+
     /// `close` was called; the webview is torn down but still waiting for CEF to
     /// confirm the browser is gone.
     bool closing;
@@ -108,6 +124,9 @@ struct webview_cef_plugin {
     EGLDisplay egl_display;
     EGLContext egl_context;
     bool supports_bgra;
+
+    /// FLUTTERPI_CEF_TRACE is set; see TRACE above.
+    bool trace;
 
     /// Guards the pump bookkeeping, which CEF may touch from other threads.
     pthread_mutex_t pump_mutex;
@@ -367,6 +386,23 @@ static void on_paint(void *userdata, const void *buffer, int width, int height) 
     bool uploaded = false;
 
     wv = userdata;
+
+    if (plugin.trace) {
+        // The first frames are what you want to see; after that a heartbeat is
+        // enough, since 30fps of this would drown out everything else.
+        wv->n_frames++;
+        if (wv->n_frames <= 3 || wv->n_frames % 100 == 0) {
+            TRACE(
+                "paint %" PRIu64 ": browser %d, %dx%d px, texture %" PRId64 "%s\n",
+                wv->n_frames,
+                wv->browser_id,
+                width,
+                height,
+                wv->texture_id,
+                wv->texture == NULL ? " -- DROPPED, no texture" : ""
+            );
+        }
+    }
 
     // Closed while a frame was in flight.
     if (wv->texture == NULL || width <= 0 || height <= 0) {
@@ -777,7 +813,7 @@ static int on_create(struct std_value *args, FlutterPlatformMessageResponseHandl
     wv->browser_id = wvcef_browser_get_id(wv->browser);
     webview_list_add(wv);
 
-    LOG_DEBUG("Created webview: browser %d, texture %" PRId64 ", url %s\n", wv->browser_id, wv->texture_id, url != NULL ? url : "about:blank");
+    TRACE("created: browser %d, texture %" PRId64 ", url %s\n", wv->browser_id, wv->texture_id, url != NULL ? url : "about:blank");
 
     pump_soon();
 
@@ -894,6 +930,14 @@ static int on_set_size(struct std_value *args, FlutterPlatformMessageResponseHan
     wv->pixel_ratio = dpi;
     wv->logical_width = (int) (width > 1.0 ? width : 1.0);
     wv->logical_height = (int) (height > 1.0 ? height : 1.0);
+
+    TRACE(
+        "setSize: browser %d, %dx%d logical, dpi %.2f\n",
+        wv->browser_id,
+        wv->logical_width,
+        wv->logical_height,
+        wv->pixel_ratio
+    );
 
     wvcef_browser_resize(wv->browser, wv->logical_width, wv->logical_height, wv->pixel_ratio);
     pump_soon();
@@ -1146,7 +1190,10 @@ enum plugin_init_result webview_cef_init(struct flutterpi *flutterpi, void **use
     plugin.flutterpi = flutterpi;
     plugin.egl_display = display;
     plugin.egl_context = context;
+    plugin.trace = getenv("FLUTTERPI_CEF_TRACE") != NULL;
     plugin.supports_bgra = gl_renderer_supports_gl_extension(renderer, "GL_EXT_texture_format_BGRA8888");
+
+    TRACE("plugin up. BGRA textures: %s\n", plugin.supports_bgra ? "yes" : "no, converting on the CPU");
 
     if (!plugin.supports_bgra) {
         LOG_ERROR("GL_EXT_texture_format_BGRA8888 is missing; webview frames will be converted on the CPU, which is slow.\n");
