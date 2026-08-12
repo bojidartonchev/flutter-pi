@@ -2,9 +2,9 @@
 /*
  * CEF powered webview plugin
  *
- * The flutter-pi side of the webview: owns the platform channel, drives CEF's
- * message pump from flutter-pi's event loop, and turns the BGRA frames CEF
- * renders off-screen into flutter external textures.
+ * The flutter-pi side of the webview: speaks the `webview_cef` pub package's
+ * platform channel, drives CEF's message pump from flutter-pi's event loop, and
+ * turns the BGRA frames CEF renders off-screen into flutter external textures.
  *
  * Everything in here runs on the platform thread:
  *   - platform channel handlers are dispatched there by the plugin registry,
@@ -14,7 +14,7 @@
  * The only exception is on_schedule_pump_work, which CEF may call from any
  * thread; it just posts a task back to the platform thread.
  *
- * Copyright (c) 2026, EGT
+ * Copyright (c) 2026, Bojidar Tonchev <bojidar.tonchev@gmail.com>
  */
 
 #define _GNU_SOURCE
@@ -48,7 +48,7 @@
 
 /// Where the CEF runtime files (libcef.so, icudtl.dat, *.pak, *.bin, locales/)
 /// were installed. Overridable at configure time and at runtime, see
-/// resolve_path() below.
+/// resolve_env() below.
 #ifndef WEBVIEW_CEF_RUNTIME_DIR
     #define WEBVIEW_CEF_RUNTIME_DIR "/usr/lib/cef"
 #endif
@@ -59,11 +59,12 @@
 #endif
 
 #define MAX_SWITCHES 64
+#define DEFAULT_FRAME_RATE 30
 
-/// Chromium switches we pass unless the app overrides them. The important ones
-/// are the first three: there is no X server and no wayland compositor on the
-/// kiosk, so Chromium has to use the headless ozone platform and must not try to
-/// bring up its own GPU stack next to flutter-pi's.
+/// Chromium switches we pass unless FLUTTERPI_CEF_NO_DEFAULT_SWITCHES is set.
+/// The important ones are the first three: flutter-pi owns the DRM master and
+/// there is no X server or wayland compositor to talk to, so Chromium has to use
+/// the headless ozone platform and must not bring up a GPU stack of its own.
 static const char *const default_switches[] = {
     "ozone-platform=headless",
     "disable-gpu",
@@ -78,9 +79,12 @@ struct webview {
     struct texture *texture;
     int64_t texture_id;
 
+    /// CEF's browser identifier. This is what the dart side addresses us by.
+    int browser_id;
+
     struct wvcef_browser *browser;
 
-    /// Logical size & scale, as last told by the dart side.
+    /// Logical size & scale, as last reported by `setSize`.
     int logical_width, logical_height;
     double pixel_ratio;
 
@@ -93,9 +97,9 @@ struct webview {
     uint8_t *swizzle_buffer;
     size_t swizzle_buffer_size;
 
-    /// dart called `dispose`; the webview is torn down but still waiting for
-    /// CEF to confirm the browser is gone.
-    bool disposing;
+    /// `close` was called; the webview is torn down but still waiting for CEF to
+    /// confirm the browser is gone.
+    bool closing;
 };
 
 struct webview_cef_plugin {
@@ -104,8 +108,6 @@ struct webview_cef_plugin {
     EGLDisplay egl_display;
     EGLContext egl_context;
     bool supports_bgra;
-
-    bool cef_initialized;
 
     /// Guards the pump bookkeeping, which CEF may touch from other threads.
     pthread_mutex_t pump_mutex;
@@ -131,15 +133,9 @@ static uint64_t now_monotonic_us(void) {
     return (uint64_t) ts.tv_sec * 1000000ull + (uint64_t) ts.tv_nsec / 1000ull;
 }
 
-/// dart argument > environment variable > compile time default.
-static const char *resolve_path(const char *from_dart, const char *env_name, const char *fallback) {
-    const char *env;
+static const char *resolve_env(const char *env_name, const char *fallback) {
+    const char *env = getenv(env_name);
 
-    if (from_dart != NULL && from_dart[0] != '\0') {
-        return from_dart;
-    }
-
-    env = getenv(env_name);
     if (env != NULL && env[0] != '\0') {
         return env;
     }
@@ -147,15 +143,36 @@ static const char *resolve_path(const char *from_dart, const char *env_name, con
     return fallback;
 }
 
-static struct std_value *arg_get(struct std_value *args, const char *key) {
-    if (args == NULL || !STDVALUE_IS_MAP(*args)) {
-        return NULL;
+static long resolve_env_long(const char *env_name, long fallback) {
+    const char *env = getenv(env_name);
+    char *end;
+    long value;
+
+    if (env == NULL || env[0] == '\0') {
+        return fallback;
     }
-    return stdmap_get_str(args, (char *) key);
+
+    errno = 0;
+    value = strtol(env, &end, 10);
+    if (errno != 0 || end == env || *end != '\0') {
+        LOG_ERROR("Ignoring %s: \"%s\" is not a number.\n", env_name, env);
+        return fallback;
+    }
+
+    return value;
 }
 
-static bool arg_get_int(struct std_value *args, const char *key, int64_t *out) {
-    struct std_value *value = arg_get(args, key);
+/// The webview_cef dart side passes arguments as a positional list, or as a bare
+/// value for the single-argument methods.
+static struct std_value *arg_at(struct std_value *args, size_t index) {
+    if (args == NULL || !STDVALUE_IS_LIST(*args) || index >= args->size) {
+        return NULL;
+    }
+    return args->list + index;
+}
+
+static bool arg_int_at(struct std_value *args, size_t index, int64_t *out) {
+    struct std_value *value = arg_at(args, index);
 
     if (value == NULL || !STDVALUE_IS_INT(*value)) {
         return false;
@@ -165,8 +182,8 @@ static bool arg_get_int(struct std_value *args, const char *key, int64_t *out) {
     return true;
 }
 
-static bool arg_get_num(struct std_value *args, const char *key, double *out) {
-    struct std_value *value = arg_get(args, key);
+static bool arg_num_at(struct std_value *args, size_t index, double *out) {
+    struct std_value *value = arg_at(args, index);
 
     if (value == NULL || !STDVALUE_IS_NUM(*value)) {
         return false;
@@ -176,8 +193,8 @@ static bool arg_get_num(struct std_value *args, const char *key, double *out) {
     return true;
 }
 
-static const char *arg_get_string(struct std_value *args, const char *key) {
-    struct std_value *value = arg_get(args, key);
+static const char *arg_string_at(struct std_value *args, size_t index) {
+    struct std_value *value = arg_at(args, index);
 
     if (value == NULL || !STDVALUE_IS_STRING(*value)) {
         return NULL;
@@ -186,19 +203,20 @@ static const char *arg_get_string(struct std_value *args, const char *key) {
     return STDVALUE_AS_STRING(*value);
 }
 
-static bool arg_get_bool(struct std_value *args, const char *key, bool fallback) {
-    struct std_value *value = arg_get(args, key);
+static bool arg_bool_at(struct std_value *args, size_t index, bool *out) {
+    struct std_value *value = arg_at(args, index);
 
     if (value == NULL || !STDVALUE_IS_BOOL(*value)) {
-        return fallback;
+        return false;
     }
 
-    return STDVALUE_AS_BOOL(*value);
+    *out = STDVALUE_AS_BOOL(*value);
+    return true;
 }
 
-static struct webview *webview_find(int64_t texture_id) {
+static struct webview *webview_find(int browser_id) {
     for (struct webview *wv = plugin.webviews; wv != NULL; wv = wv->next) {
-        if (wv->texture_id == texture_id) {
+        if (wv->browser_id == browser_id) {
             return wv;
         }
     }
@@ -219,6 +237,30 @@ static void webview_list_remove(struct webview *wv) {
             return;
         }
         slot = &(*slot)->next;
+    }
+}
+
+static void webview_free(struct webview *wv) {
+    webview_list_remove(wv);
+    free(wv->swizzle_buffer);
+    free(wv);
+}
+
+/// Releases the flutter texture and the GL texture. Safe to call twice.
+static void webview_release_textures(struct webview *wv) {
+    if (wv->texture != NULL) {
+        texture_destroy(wv->texture);
+        wv->texture = NULL;
+    }
+
+    if (wv->gl_texture != 0) {
+        if (eglMakeCurrent(plugin.egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, plugin.egl_context) == EGL_TRUE) {
+            glDeleteTextures(1, &wv->gl_texture);
+            eglMakeCurrent(plugin.egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+        } else {
+            LOG_ERROR("Could not make the webview EGL context current to delete a texture. eglMakeCurrent: 0x%04X\n", eglGetError());
+        }
+        wv->gl_texture = 0;
     }
 }
 
@@ -285,7 +327,7 @@ static void on_texture_frame_destroy(const struct texture_frame *frame, void *us
     (void) userdata;
 }
 
-/// Converts BGRA to RGBA in place of a scratch buffer, for drivers without
+/// Converts BGRA to RGBA into a scratch buffer, for drivers without
 /// GL_EXT_texture_format_BGRA8888.
 static const void *swizzle_bgra_to_rgba(struct webview *wv, const void *buffer, int width, int height) {
     const uint8_t *src;
@@ -326,7 +368,7 @@ static void on_paint(void *userdata, const void *buffer, int width, int height) 
 
     wv = userdata;
 
-    // Disposed while a frame was in flight.
+    // Closed while a frame was in flight.
     if (wv->texture == NULL || width <= 0 || height <= 0) {
         return;
     }
@@ -426,19 +468,22 @@ clear_context:
 
 // ---------------------------------------------------------------------------
 // events towards dart
+//
+// The webview_cef dart side keys everything off the CEF browser id and reads the
+// arguments out of a map.
 // ---------------------------------------------------------------------------
 
-static void send_event(int64_t texture_id, const char *method, struct std_value *extra_keys, struct std_value *extra_values, size_t n_extra) {
-    struct std_value keys[5];
-    struct std_value values[5];
+static void send_event(int browser_id, const char *method, struct std_value *extra_keys, struct std_value *extra_values, size_t n_extra) {
+    struct std_value keys[6];
+    struct std_value values[6];
     struct std_value event;
 
-    if (n_extra > 4) {
-        n_extra = 4;
+    if (n_extra > 5) {
+        n_extra = 5;
     }
 
-    keys[0] = STDSTRING("textureId");
-    values[0] = STDINT64(texture_id);
+    keys[0] = STDSTRING("browserId");
+    values[0] = STDINT32(browser_id);
 
     for (size_t i = 0; i < n_extra; i++) {
         keys[i + 1] = extra_keys[i];
@@ -453,44 +498,77 @@ static void send_event(int64_t texture_id, const char *method, struct std_value 
     platch_call_std(WEBVIEW_CEF_CHANNEL, (char *) method, &event, NULL, NULL);
 }
 
-static void on_loading_state_changed(void *userdata, bool is_loading, bool can_go_back, bool can_go_forward) {
-    struct webview *wv = userdata;
+static void send_string_event(int browser_id, const char *method, const char *key, const char *value) {
+    struct std_value keys[1] = { STDSTRING((char *) key) };
+    struct std_value values[1] = { STDSTRING((char *) (value != NULL ? value : "")) };
 
-    struct std_value keys[3] = { STDSTRING("isLoading"), STDSTRING("canGoBack"), STDSTRING("canGoForward") };
-    struct std_value values[3] = { STDBOOL(is_loading), STDBOOL(can_go_back), STDBOOL(can_go_forward) };
-
-    send_event(wv->texture_id, "onLoadingStateChanged", keys, values, 3);
+    send_event(browser_id, method, keys, values, 1);
 }
 
 static void on_url_changed(void *userdata, const char *url) {
     struct webview *wv = userdata;
-
-    struct std_value keys[1] = { STDSTRING("url") };
-    struct std_value values[1] = { STDSTRING((char *) (url != NULL ? url : "")) };
-
-    send_event(wv->texture_id, "onUrlChanged", keys, values, 1);
+    send_string_event(wv->browser_id, "urlChanged", "url", url);
 }
 
 static void on_title_changed(void *userdata, const char *title) {
     struct webview *wv = userdata;
+    send_string_event(wv->browser_id, "titleChanged", "title", title);
+}
 
-    struct std_value keys[1] = { STDSTRING("title") };
-    struct std_value values[1] = { STDSTRING((char *) (title != NULL ? title : "")) };
+static void on_tooltip(void *userdata, const char *text) {
+    struct webview *wv = userdata;
+    send_string_event(wv->browser_id, "onTooltip", "text", text);
+}
 
-    send_event(wv->texture_id, "onTitleChanged", keys, values, 1);
+static void on_load_start(void *userdata, const char *url) {
+    struct webview *wv = userdata;
+    // The dart side really does call this key "urlId".
+    send_string_event(wv->browser_id, "onLoadStart", "urlId", url);
+}
+
+static void on_load_end(void *userdata, const char *url, int http_status_code) {
+    struct webview *wv = userdata;
+
+    (void) http_status_code;
+    send_string_event(wv->browser_id, "onLoadEnd", "urlId", url);
 }
 
 static void on_load_error(void *userdata, int error_code, const char *error_text, const char *failed_url) {
     struct webview *wv = userdata;
 
-    struct std_value keys[3] = { STDSTRING("errorCode"), STDSTRING("errorText"), STDSTRING("failedUrl") };
-    struct std_value values[3] = {
-        STDINT32(error_code),
-        STDSTRING((char *) (error_text != NULL ? error_text : "")),
-        STDSTRING((char *) (failed_url != NULL ? failed_url : "")),
+    // The webview_cef dart API has no load error callback, so this is only
+    // useful in the log. CEF still calls OnLoadEnd afterwards, which the app
+    // does see.
+    LOG_ERROR(
+        "Webview %d could not load %s: %s (%d)\n",
+        wv->browser_id,
+        failed_url != NULL ? failed_url : "(?)",
+        error_text != NULL ? error_text : "(?)",
+        error_code
+    );
+}
+
+static void on_cursor_changed(void *userdata, int cursor_type) {
+    struct webview *wv = userdata;
+
+    struct std_value keys[1] = { STDSTRING("type") };
+    struct std_value values[1] = { STDINT32(cursor_type) };
+
+    send_event(wv->browser_id, "onCursorChanged", keys, values, 1);
+}
+
+static void on_console_message(void *userdata, int level, const char *message, const char *source, int line) {
+    struct webview *wv = userdata;
+
+    struct std_value keys[4] = { STDSTRING("level"), STDSTRING("message"), STDSTRING("source"), STDSTRING("line") };
+    struct std_value values[4] = {
+        STDINT32(level),
+        STDSTRING((char *) (message != NULL ? message : "")),
+        STDSTRING((char *) (source != NULL ? source : "")),
+        STDINT32(line),
     };
 
-    send_event(wv->texture_id, "onLoadError", keys, values, 3);
+    send_event(wv->browser_id, "onConsoleMessage", keys, values, 4);
 }
 
 /// The browser is really gone now, so the webview can be freed.
@@ -499,28 +577,28 @@ static void on_browser_closed(void *userdata) {
 
     wv->browser = NULL;
 
-    if (!wv->disposing) {
-        // CEF closed the browser on its own (a crashed renderer, for example).
-        // Tell dart, and keep the texture around showing the last frame.
-        struct std_value keys[3] = { STDSTRING("errorCode"), STDSTRING("errorText"), STDSTRING("failedUrl") };
-        struct std_value values[3] = { STDINT32(0), STDSTRING("The browser was closed unexpectedly."), STDSTRING("") };
-
-        LOG_ERROR("Webview %" PRId64 " was closed by CEF.\n", wv->texture_id);
-        send_event(wv->texture_id, "onLoadError", keys, values, 3);
+    if (!wv->closing) {
+        // CEF closed the browser on its own -- a crashed renderer, most likely.
+        // Keep the texture around showing the last frame; the dart side still
+        // holds a controller for it and would only get a black rectangle
+        // otherwise.
+        LOG_ERROR("Webview %d was closed by CEF.\n", wv->browser_id);
         return;
     }
 
-    webview_list_remove(wv);
-    free(wv->swizzle_buffer);
-    free(wv);
+    webview_free(wv);
 }
 
 static const struct wvcef_host_callbacks host_callbacks = {
     .on_paint = on_paint,
-    .on_loading_state_changed = on_loading_state_changed,
+    .on_load_start = on_load_start,
+    .on_load_end = on_load_end,
+    .on_load_error = on_load_error,
     .on_url_changed = on_url_changed,
     .on_title_changed = on_title_changed,
-    .on_load_error = on_load_error,
+    .on_tooltip = on_tooltip,
+    .on_console_message = on_console_message,
+    .on_cursor_changed = on_cursor_changed,
     .on_closed = on_browser_closed,
 };
 
@@ -528,8 +606,8 @@ static const struct wvcef_host_callbacks host_callbacks = {
 // CEF initialization
 // ---------------------------------------------------------------------------
 
-/// Splits a comma separated switch list into `switches`, writing into `storage`.
-/// Returns the number of switches added.
+/// Splits a comma separated switch list into `switches`, writing into `list`
+/// (which is modified in place). Returns the new switch count.
 static size_t parse_switch_list(char *list, const char **switches, size_t n_switches, size_t max_switches) {
     char *cursor = list;
 
@@ -550,7 +628,13 @@ static size_t parse_switch_list(char *list, const char **switches, size_t n_swit
     return n_switches;
 }
 
-static int ensure_cef_initialized(struct std_value *args) {
+/**
+ * @brief Starts CEF, if it isn't running yet.
+ *
+ * The webview_cef channel only carries a user agent, so everything else is
+ * configured through the environment -- see the README.
+ */
+static int ensure_cef_initialized(const char *user_agent) {
     struct wvcef_init_options options;
     const char *switches[MAX_SWITCHES];
     char *env_switches_copy = NULL;
@@ -558,54 +642,40 @@ static int ensure_cef_initialized(struct std_value *args) {
     char locales_dir[512];
     const char *runtime_dir;
     const char *env_switches;
-    struct std_value *switch_list;
     size_t n_switches = 0;
-    int64_t log_severity = 0;
     int ok;
 
-    if (plugin.cef_initialized) {
+    if (wvcef_is_initialized()) {
         return 0;
     }
 
     memset(&options, 0, sizeof options);
 
-    runtime_dir = resolve_path(arg_get_string(args, "runtimeDir"), "FLUTTERPI_CEF_RUNTIME_DIR", WEBVIEW_CEF_RUNTIME_DIR);
+    runtime_dir = resolve_env("FLUTTERPI_CEF_RUNTIME_DIR", WEBVIEW_CEF_RUNTIME_DIR);
 
     snprintf(resources_dir, sizeof(resources_dir), "%s", runtime_dir);
     snprintf(locales_dir, sizeof(locales_dir), "%s/locales", runtime_dir);
 
-    options.subprocess_path = resolve_path(arg_get_string(args, "helperPath"), "FLUTTERPI_CEF_HELPER", WEBVIEW_CEF_HELPER_PATH);
+    options.subprocess_path = resolve_env("FLUTTERPI_CEF_HELPER", WEBVIEW_CEF_HELPER_PATH);
     options.resources_dir = resources_dir;
     options.locales_dir = locales_dir;
-    options.cache_path = arg_get_string(args, "cachePath");
-    options.user_agent = arg_get_string(args, "userAgent");
-    options.log_file = resolve_path(arg_get_string(args, "logFile"), "FLUTTERPI_CEF_LOG_FILE", NULL);
+    options.cache_path = resolve_env("FLUTTERPI_CEF_CACHE_PATH", NULL);
+    options.user_agent = user_agent;
+    options.log_file = resolve_env("FLUTTERPI_CEF_LOG_FILE", NULL);
+    options.log_severity = (int) resolve_env_long("FLUTTERPI_CEF_LOG_SEVERITY", 0);
 
-    if (arg_get_int(args, "logSeverity", &log_severity)) {
-        options.log_severity = (int) log_severity;
-    }
-
-    if (arg_get_bool(args, "useDefaultSwitches", true)) {
+    if (getenv("FLUTTERPI_CEF_NO_DEFAULT_SWITCHES") == NULL) {
         for (size_t i = 0; i < ARRAY_SIZE(default_switches) && n_switches < MAX_SWITCHES; i++) {
             switches[n_switches++] = default_switches[i];
         }
     }
 
-    // FLUTTERPI_CEF_SWITCHES=disable-gpu,ozone-platform=headless
+    // FLUTTERPI_CEF_SWITCHES=disable-web-security,enable-logging=stderr
     env_switches = getenv("FLUTTERPI_CEF_SWITCHES");
     if (env_switches != NULL && env_switches[0] != '\0') {
         env_switches_copy = strdup(env_switches);
         if (env_switches_copy != NULL) {
             n_switches = parse_switch_list(env_switches_copy, switches, n_switches, MAX_SWITCHES);
-        }
-    }
-
-    switch_list = arg_get(args, "switches");
-    if (switch_list != NULL && STDVALUE_IS_LIST(*switch_list)) {
-        for (size_t i = 0; i < switch_list->size && n_switches < MAX_SWITCHES; i++) {
-            if (STDVALUE_IS_STRING(switch_list->list[i])) {
-                switches[n_switches++] = STDVALUE_AS_STRING(switch_list->list[i]);
-            }
         }
     }
 
@@ -624,7 +694,6 @@ static int ensure_cef_initialized(struct std_value *args) {
         return ok;
     }
 
-    plugin.cef_initialized = true;
     pump_soon();
     return 0;
 }
@@ -633,9 +702,16 @@ static int ensure_cef_initialized(struct std_value *args) {
 // method handlers
 // ---------------------------------------------------------------------------
 
+/// `init` takes the user agent directly, or nothing at all.
 static int on_init(struct std_value *args, FlutterPlatformMessageResponseHandle *response_handle) {
-    int ok = ensure_cef_initialized(args);
+    const char *user_agent = NULL;
+    int ok;
 
+    if (args != NULL && STDVALUE_IS_STRING(*args)) {
+        user_agent = STDVALUE_AS_STRING(*args);
+    }
+
+    ok = ensure_cef_initialized(user_agent);
     if (ok != 0) {
         return platch_respond_error_std(response_handle, "cef-init-failed", "Could not initialize CEF. See the flutter-pi log.", &STDNULL);
     }
@@ -643,39 +719,35 @@ static int on_init(struct std_value *args, FlutterPlatformMessageResponseHandle 
     return platch_respond_success_std(response_handle, &STDNULL);
 }
 
+/// `create` takes the url directly and answers with [browserId, textureId].
 static int on_create(struct std_value *args, FlutterPlatformMessageResponseHandle *response_handle) {
     struct webview *wv;
-    const char *url;
-    double width = 0.0, height = 0.0, pixel_ratio = 1.0;
-    int64_t frame_rate = 30;
+    const char *url = NULL;
+    long frame_rate;
     int ok;
 
-    ok = ensure_cef_initialized(args);
+    ok = ensure_cef_initialized(NULL);
     if (ok != 0) {
         return platch_respond_error_std(response_handle, "cef-init-failed", "Could not initialize CEF. See the flutter-pi log.", &STDNULL);
     }
 
-    url = arg_get_string(args, "url");
-
-    if (!arg_get_num(args, "width", &width) || !arg_get_num(args, "height", &height)) {
-        return platch_respond_illegal_arg_std(response_handle, "Expected `width` and `height` to be numbers.");
+    if (args != NULL && STDVALUE_IS_STRING(*args)) {
+        url = STDVALUE_AS_STRING(*args);
     }
 
-    arg_get_num(args, "pixelRatio", &pixel_ratio);
-    arg_get_int(args, "frameRate", &frame_rate);
-
-    if (pixel_ratio <= 0.0) {
-        pixel_ratio = 1.0;
-    }
+    frame_rate = resolve_env_long("FLUTTERPI_CEF_FRAME_RATE", DEFAULT_FRAME_RATE);
 
     wv = calloc(1, sizeof *wv);
     if (wv == NULL) {
         return platch_respond_native_error_std(response_handle, ENOMEM);
     }
 
-    wv->logical_width = (int) (width > 1.0 ? width : 1.0);
-    wv->logical_height = (int) (height > 1.0 ? height : 1.0);
-    wv->pixel_ratio = pixel_ratio;
+    // The dart side doesn't know the widget size yet at this point -- it calls
+    // `setSize` once the webview has been laid out. Until then CEF renders at
+    // the smallest size it accepts.
+    wv->logical_width = 1;
+    wv->logical_height = 1;
+    wv->pixel_ratio = 1.0;
 
     wv->texture = flutterpi_create_texture(plugin.flutterpi);
     if (wv->texture == NULL) {
@@ -685,9 +757,6 @@ static int on_create(struct std_value *args, FlutterPlatformMessageResponseHandl
     }
 
     wv->texture_id = texture_get_id(wv->texture);
-
-    // Registered before the browser exists so a very early on_paint can find it.
-    webview_list_add(wv);
 
     wv->browser = wvcef_browser_create(
         url,
@@ -700,80 +769,84 @@ static int on_create(struct std_value *args, FlutterPlatformMessageResponseHandl
     );
     if (wv->browser == NULL) {
         LOG_ERROR("Could not create the CEF browser.\n");
-        webview_list_remove(wv);
         texture_destroy(wv->texture);
         free(wv);
         return platch_respond_error_std(response_handle, "browser-failed", "Could not create the CEF browser.", &STDNULL);
     }
 
-    LOG_DEBUG(
-        "Created webview %" PRId64 " (%dx%d @ %.2f) for %s\n",
-        wv->texture_id,
-        wv->logical_width,
-        wv->logical_height,
-        wv->pixel_ratio,
-        url != NULL ? url : "about:blank"
-    );
+    wv->browser_id = wvcef_browser_get_id(wv->browser);
+    webview_list_add(wv);
+
+    LOG_DEBUG("Created webview: browser %d, texture %" PRId64 ", url %s\n", wv->browser_id, wv->texture_id, url != NULL ? url : "about:blank");
 
     pump_soon();
 
-    return platch_respond_success_std(response_handle, &STDINT64(wv->texture_id));
+    return platch_respond_success_std(
+        response_handle,
+        &(struct std_value){
+            .type = kStdList,
+            .size = 2,
+            .list = (struct std_value[2]){ STDINT32(wv->browser_id), STDINT64(wv->texture_id) },
+        }
+    );
 }
 
-/// Looks up the webview a call refers to, responding with an error if it's gone.
-static struct webview *webview_for_call(struct std_value *args, FlutterPlatformMessageResponseHandle *response_handle, int *response_out) {
+/// For `close`, `reload`, `goBack` and `goForward`, which take the browser id as
+/// a bare integer.
+static struct webview *webview_from_bare_id(struct std_value *args, FlutterPlatformMessageResponseHandle *response_handle, int *response_out) {
     struct webview *wv;
-    int64_t texture_id = 0;
 
-    if (!arg_get_int(args, "textureId", &texture_id)) {
-        *response_out = platch_respond_illegal_arg_std(response_handle, "Expected `textureId` to be an integer.");
+    if (args == NULL || !STDVALUE_IS_INT(*args)) {
+        *response_out = platch_respond_illegal_arg_std(response_handle, "Expected the browser id to be an integer.");
         return NULL;
     }
 
-    wv = webview_find(texture_id);
-    if (wv == NULL || wv->disposing) {
-        *response_out = platch_respond_error_std(response_handle, "no-such-webview", "There is no webview with that textureId.", &STDNULL);
+    wv = webview_find((int) STDVALUE_AS_INT(*args));
+    if (wv == NULL || wv->closing) {
+        *response_out = platch_respond_error_std(response_handle, "no-such-webview", "There is no webview with that browser id.", &STDNULL);
         return NULL;
     }
 
     return wv;
 }
 
-static int on_dispose(struct std_value *args, FlutterPlatformMessageResponseHandle *response_handle) {
+/// For everything else: the browser id is the first element of the argument list.
+static struct webview *webview_from_list(struct std_value *args, FlutterPlatformMessageResponseHandle *response_handle, int *response_out) {
+    struct webview *wv;
+    int64_t browser_id;
+
+    if (!arg_int_at(args, 0, &browser_id)) {
+        *response_out = platch_respond_illegal_arg_std(response_handle, "Expected a list with the browser id as its first element.");
+        return NULL;
+    }
+
+    wv = webview_find((int) browser_id);
+    if (wv == NULL || wv->closing) {
+        *response_out = platch_respond_error_std(response_handle, "no-such-webview", "There is no webview with that browser id.", &STDNULL);
+        return NULL;
+    }
+
+    return wv;
+}
+
+static int on_close(struct std_value *args, FlutterPlatformMessageResponseHandle *response_handle) {
     struct webview *wv;
     int response = 0;
 
-    wv = webview_for_call(args, response_handle, &response);
+    wv = webview_from_bare_id(args, response_handle, &response);
     if (wv == NULL) {
         return response;
     }
 
-    wv->disposing = true;
-
-    // Stop rendering into the texture before it goes away.
-    if (wv->texture != NULL) {
-        texture_destroy(wv->texture);
-        wv->texture = NULL;
-    }
-
-    if (wv->gl_texture != 0) {
-        if (eglMakeCurrent(plugin.egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, plugin.egl_context) == EGL_TRUE) {
-            glDeleteTextures(1, &wv->gl_texture);
-            eglMakeCurrent(plugin.egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
-        } else {
-            LOG_ERROR("Could not make the webview EGL context current to delete a texture. eglMakeCurrent: 0x%04X\n", eglGetError());
-        }
-        wv->gl_texture = 0;
-    }
+    wv->closing = true;
+    webview_release_textures(wv);
 
     if (wv->browser != NULL) {
         // `wv` is freed in on_browser_closed.
         wvcef_browser_close(wv->browser);
         pump_soon();
     } else {
-        webview_list_remove(wv);
-        free(wv->swizzle_buffer);
-        free(wv);
+        webview_free(wv);
     }
 
     return platch_respond_success_std(response_handle, &STDNULL);
@@ -784,14 +857,14 @@ static int on_load_url(struct std_value *args, FlutterPlatformMessageResponseHan
     const char *url;
     int response = 0;
 
-    wv = webview_for_call(args, response_handle, &response);
+    wv = webview_from_list(args, response_handle, &response);
     if (wv == NULL) {
         return response;
     }
 
-    url = arg_get_string(args, "url");
+    url = arg_string_at(args, 1);
     if (url == NULL) {
-        return platch_respond_illegal_arg_std(response_handle, "Expected `url` to be a string.");
+        return platch_respond_illegal_arg_std(response_handle, "Expected the url to be a string.");
     }
 
     wvcef_browser_load_url(wv->browser, url);
@@ -802,29 +875,144 @@ static int on_load_url(struct std_value *args, FlutterPlatformMessageResponseHan
 
 static int on_set_size(struct std_value *args, FlutterPlatformMessageResponseHandle *response_handle) {
     struct webview *wv;
-    double width = 0.0, height = 0.0, pixel_ratio;
+    double dpi = 1.0, width = 0.0, height = 0.0;
     int response = 0;
 
-    wv = webview_for_call(args, response_handle, &response);
+    wv = webview_from_list(args, response_handle, &response);
     if (wv == NULL) {
         return response;
     }
 
-    if (!arg_get_num(args, "width", &width) || !arg_get_num(args, "height", &height)) {
-        return platch_respond_illegal_arg_std(response_handle, "Expected `width` and `height` to be numbers.");
+    if (!arg_num_at(args, 1, &dpi) || !arg_num_at(args, 2, &width) || !arg_num_at(args, 3, &height)) {
+        return platch_respond_illegal_arg_std(response_handle, "Expected [browserId, dpi, width, height].");
     }
 
-    pixel_ratio = wv->pixel_ratio;
-    arg_get_num(args, "pixelRatio", &pixel_ratio);
-    if (pixel_ratio <= 0.0) {
-        pixel_ratio = 1.0;
+    if (dpi <= 0.0) {
+        dpi = 1.0;
     }
 
+    wv->pixel_ratio = dpi;
     wv->logical_width = (int) (width > 1.0 ? width : 1.0);
     wv->logical_height = (int) (height > 1.0 ? height : 1.0);
-    wv->pixel_ratio = pixel_ratio;
 
     wvcef_browser_resize(wv->browser, wv->logical_width, wv->logical_height, wv->pixel_ratio);
+    pump_soon();
+
+    return platch_respond_success_std(response_handle, &STDNULL);
+}
+
+/// cursorMove, cursorDragging, cursorClickDown and cursorClickUp all take
+/// [browserId, x, y].
+static int on_cursor_event(const char *method, struct std_value *args, FlutterPlatformMessageResponseHandle *response_handle) {
+    struct webview *wv;
+    int64_t x = 0, y = 0;
+    int response = 0;
+
+    wv = webview_from_list(args, response_handle, &response);
+    if (wv == NULL) {
+        return response;
+    }
+
+    if (!arg_int_at(args, 1, &x) || !arg_int_at(args, 2, &y)) {
+        return platch_respond_illegal_arg_std(response_handle, "Expected [browserId, x, y].");
+    }
+
+    if (streq(method, "cursorMove")) {
+        wvcef_browser_send_mouse_move(wv->browser, (int) x, (int) y, false);
+    } else if (streq(method, "cursorDragging")) {
+        wvcef_browser_send_mouse_move(wv->browser, (int) x, (int) y, true);
+    } else if (streq(method, "cursorClickDown")) {
+        wvcef_browser_send_mouse_click(wv->browser, (int) x, (int) y, false);
+    } else {
+        wvcef_browser_send_mouse_click(wv->browser, (int) x, (int) y, true);
+    }
+
+    pump_soon();
+    return platch_respond_success_std(response_handle, &STDNULL);
+}
+
+static int on_set_scroll_delta(struct std_value *args, FlutterPlatformMessageResponseHandle *response_handle) {
+    struct webview *wv;
+    int64_t x = 0, y = 0, delta_x = 0, delta_y = 0;
+    int response = 0;
+
+    wv = webview_from_list(args, response_handle, &response);
+    if (wv == NULL) {
+        return response;
+    }
+
+    if (!arg_int_at(args, 1, &x) || !arg_int_at(args, 2, &y) || !arg_int_at(args, 3, &delta_x) || !arg_int_at(args, 4, &delta_y)) {
+        return platch_respond_illegal_arg_std(response_handle, "Expected [browserId, x, y, deltaX, deltaY].");
+    }
+
+    wvcef_browser_send_mouse_wheel(wv->browser, (int) x, (int) y, (int) delta_x, (int) delta_y);
+    pump_soon();
+
+    return platch_respond_success_std(response_handle, &STDNULL);
+}
+
+static int on_set_client_focus(struct std_value *args, FlutterPlatformMessageResponseHandle *response_handle) {
+    struct webview *wv;
+    bool focused = true;
+    int response = 0;
+
+    wv = webview_from_list(args, response_handle, &response);
+    if (wv == NULL) {
+        return response;
+    }
+
+    arg_bool_at(args, 1, &focused);
+
+    wvcef_browser_set_focus(wv->browser, focused);
+    pump_soon();
+
+    return platch_respond_success_std(response_handle, &STDNULL);
+}
+
+/// imeSetComposition and imeCommitText both take [browserId, text]. This is how
+/// the dart side delivers typed text -- see the README about what it takes for
+/// the page to ask for it by itself.
+static int on_ime_text(const char *method, struct std_value *args, FlutterPlatformMessageResponseHandle *response_handle) {
+    struct webview *wv;
+    const char *text;
+    int response = 0;
+
+    wv = webview_from_list(args, response_handle, &response);
+    if (wv == NULL) {
+        return response;
+    }
+
+    text = arg_string_at(args, 1);
+    if (text == NULL) {
+        return platch_respond_illegal_arg_std(response_handle, "Expected [browserId, text].");
+    }
+
+    if (streq(method, "imeCommitText")) {
+        wvcef_browser_ime_commit_text(wv->browser, text);
+    } else {
+        wvcef_browser_ime_set_composition(wv->browser, text);
+    }
+
+    pump_soon();
+    return platch_respond_success_std(response_handle, &STDNULL);
+}
+
+static int on_execute_javascript(struct std_value *args, FlutterPlatformMessageResponseHandle *response_handle) {
+    struct webview *wv;
+    const char *code;
+    int response = 0;
+
+    wv = webview_from_list(args, response_handle, &response);
+    if (wv == NULL) {
+        return response;
+    }
+
+    code = arg_string_at(args, 1);
+    if (code == NULL) {
+        return platch_respond_illegal_arg_std(response_handle, "Expected the javascript code to be a string.");
+    }
+
+    wvcef_browser_execute_javascript(wv->browser, code);
     pump_soon();
 
     return platch_respond_success_std(response_handle, &STDNULL);
@@ -834,199 +1022,45 @@ static int on_navigation(const char *method, struct std_value *args, FlutterPlat
     struct webview *wv;
     int response = 0;
 
-    wv = webview_for_call(args, response_handle, &response);
+    wv = webview_from_bare_id(args, response_handle, &response);
     if (wv == NULL) {
         return response;
     }
 
     if (streq(method, "reload")) {
-        wvcef_browser_reload(wv->browser, arg_get_bool(args, "ignoreCache", false));
-    } else if (streq(method, "stopLoad")) {
-        wvcef_browser_stop_load(wv->browser);
+        wvcef_browser_reload(wv->browser, false);
     } else if (streq(method, "goBack")) {
         wvcef_browser_go_back(wv->browser);
-    } else if (streq(method, "goForward")) {
+    } else {
         wvcef_browser_go_forward(wv->browser);
-    } else if (streq(method, "invalidate")) {
-        wvcef_browser_invalidate(wv->browser);
-    } else {
-        return platch_respond_not_implemented(response_handle);
     }
 
     pump_soon();
     return platch_respond_success_std(response_handle, &STDNULL);
 }
 
-static int on_set_focus(struct std_value *args, FlutterPlatformMessageResponseHandle *response_handle) {
-    struct webview *wv;
-    int response = 0;
+/**
+ * @brief `quit` only releases the browsers.
+ *
+ * CEF cannot be initialized twice in a process, so actually calling CefShutdown
+ * here would make every later webview fail. flutter-pi tears CEF down in the
+ * plugin's deinit anyway, which is the only point where nothing can come back.
+ */
+static int on_quit(FlutterPlatformMessageResponseHandle *response_handle) {
+    for (struct webview *wv = plugin.webviews, *next = NULL; wv != NULL; wv = next) {
+        next = wv->next;
 
-    wv = webview_for_call(args, response_handle, &response);
-    if (wv == NULL) {
-        return response;
-    }
+        wv->closing = true;
+        webview_release_textures(wv);
 
-    wvcef_browser_set_focus(wv->browser, arg_get_bool(args, "focused", true));
-    pump_soon();
-
-    return platch_respond_success_std(response_handle, &STDNULL);
-}
-
-static int on_run_javascript(struct std_value *args, FlutterPlatformMessageResponseHandle *response_handle) {
-    struct webview *wv;
-    const char *code;
-    int response = 0;
-
-    wv = webview_for_call(args, response_handle, &response);
-    if (wv == NULL) {
-        return response;
-    }
-
-    code = arg_get_string(args, "code");
-    if (code == NULL) {
-        return platch_respond_illegal_arg_std(response_handle, "Expected `code` to be a string.");
-    }
-
-    wvcef_browser_execute_javascript(wv->browser, code);
-    pump_soon();
-
-    return platch_respond_success_std(response_handle, &STDNULL);
-}
-
-static int on_pointer_event(struct std_value *args, FlutterPlatformMessageResponseHandle *response_handle) {
-    struct webview *wv;
-    const char *phase, *kind;
-    double x = 0.0, y = 0.0;
-    int64_t pointer = 0, button = 0, click_count = 1, modifiers = 0;
-    int response = 0;
-
-    wv = webview_for_call(args, response_handle, &response);
-    if (wv == NULL) {
-        return response;
-    }
-
-    phase = arg_get_string(args, "phase");
-    if (phase == NULL) {
-        return platch_respond_illegal_arg_std(response_handle, "Expected `phase` to be a string.");
-    }
-
-    if (!arg_get_num(args, "x", &x) || !arg_get_num(args, "y", &y)) {
-        return platch_respond_illegal_arg_std(response_handle, "Expected `x` and `y` to be numbers.");
-    }
-
-    kind = arg_get_string(args, "kind");
-    arg_get_int(args, "pointer", &pointer);
-    arg_get_int(args, "button", &button);
-    arg_get_int(args, "clickCount", &click_count);
-    arg_get_int(args, "modifiers", &modifiers);
-
-    if (kind != NULL && streq(kind, "touch")) {
-        enum wvcef_touch_phase touch_phase;
-
-        if (streq(phase, "down")) {
-            touch_phase = WVCEF_TOUCH_PRESSED;
-        } else if (streq(phase, "move")) {
-            touch_phase = WVCEF_TOUCH_MOVED;
-        } else if (streq(phase, "up")) {
-            touch_phase = WVCEF_TOUCH_RELEASED;
+        if (wv->browser != NULL) {
+            wvcef_browser_close(wv->browser);
         } else {
-            touch_phase = WVCEF_TOUCH_CANCELLED;
-        }
-
-        wvcef_browser_send_touch(wv->browser, (int) pointer, (int) x, (int) y, touch_phase, (uint32_t) modifiers);
-    } else {
-        if (streq(phase, "move")) {
-            wvcef_browser_send_mouse_move(wv->browser, (int) x, (int) y, false, (uint32_t) modifiers);
-        } else if (streq(phase, "down")) {
-            wvcef_browser_send_mouse_button(
-                wv->browser,
-                (int) x,
-                (int) y,
-                (enum wvcef_pointer_button) button,
-                false,
-                (int) click_count,
-                (uint32_t) modifiers
-            );
-        } else if (streq(phase, "up")) {
-            wvcef_browser_send_mouse_button(
-                wv->browser,
-                (int) x,
-                (int) y,
-                (enum wvcef_pointer_button) button,
-                true,
-                (int) click_count,
-                (uint32_t) modifiers
-            );
-        } else {
-            // "cancel": pretend the pointer left the view.
-            wvcef_browser_send_mouse_move(wv->browser, (int) x, (int) y, true, (uint32_t) modifiers);
+            webview_free(wv);
         }
     }
 
     pump_soon();
-    return platch_respond_success_std(response_handle, &STDNULL);
-}
-
-static int on_scroll(struct std_value *args, FlutterPlatformMessageResponseHandle *response_handle) {
-    struct webview *wv;
-    double x = 0.0, y = 0.0, delta_x = 0.0, delta_y = 0.0;
-    int64_t modifiers = 0;
-    int response = 0;
-
-    wv = webview_for_call(args, response_handle, &response);
-    if (wv == NULL) {
-        return response;
-    }
-
-    if (!arg_get_num(args, "x", &x) || !arg_get_num(args, "y", &y)) {
-        return platch_respond_illegal_arg_std(response_handle, "Expected `x` and `y` to be numbers.");
-    }
-
-    arg_get_num(args, "deltaX", &delta_x);
-    arg_get_num(args, "deltaY", &delta_y);
-    arg_get_int(args, "modifiers", &modifiers);
-
-    wvcef_browser_send_mouse_wheel(wv->browser, (int) x, (int) y, (int) delta_x, (int) delta_y, (uint32_t) modifiers);
-    pump_soon();
-
-    return platch_respond_success_std(response_handle, &STDNULL);
-}
-
-static int on_key_event(struct std_value *args, FlutterPlatformMessageResponseHandle *response_handle) {
-    struct webview *wv;
-    const char *phase;
-    int64_t key_code = 0, native_key_code = 0, character = 0, modifiers = 0;
-    enum wvcef_key_type type;
-    int response = 0;
-
-    wv = webview_for_call(args, response_handle, &response);
-    if (wv == NULL) {
-        return response;
-    }
-
-    phase = arg_get_string(args, "phase");
-    if (phase == NULL) {
-        return platch_respond_illegal_arg_std(response_handle, "Expected `phase` to be a string.");
-    }
-
-    arg_get_int(args, "keyCode", &key_code);
-    arg_get_int(args, "nativeKeyCode", &native_key_code);
-    arg_get_int(args, "character", &character);
-    arg_get_int(args, "modifiers", &modifiers);
-
-    if (streq(phase, "down")) {
-        type = WVCEF_KEY_DOWN;
-    } else if (streq(phase, "up")) {
-        type = WVCEF_KEY_UP;
-    } else if (streq(phase, "rawDown")) {
-        type = WVCEF_KEY_RAWDOWN;
-    } else {
-        type = WVCEF_KEY_CHAR;
-    }
-
-    wvcef_browser_send_key(wv->browser, type, (int) key_code, (int) native_key_code, (uint32_t) character, (uint32_t) modifiers);
-    pump_soon();
-
     return platch_respond_success_std(response_handle, &STDNULL);
 }
 
@@ -1043,27 +1077,36 @@ static int on_receive(char *channel, struct platch_obj *object, FlutterPlatformM
         return on_init(args, response_handle);
     } else if (streq(method, "create")) {
         return on_create(args, response_handle);
-    } else if (streq(method, "dispose")) {
-        return on_dispose(args, response_handle);
+    } else if (streq(method, "close")) {
+        return on_close(args, response_handle);
     } else if (streq(method, "loadUrl")) {
         return on_load_url(args, response_handle);
     } else if (streq(method, "setSize")) {
         return on_set_size(args, response_handle);
-    } else if (streq(method, "setFocus")) {
-        return on_set_focus(args, response_handle);
-    } else if (streq(method, "runJavaScript")) {
-        return on_run_javascript(args, response_handle);
-    } else if (streq(method, "pointerEvent")) {
-        return on_pointer_event(args, response_handle);
-    } else if (streq(method, "scroll")) {
-        return on_scroll(args, response_handle);
-    } else if (streq(method, "keyEvent")) {
-        return on_key_event(args, response_handle);
-    } else if (streq(method, "reload") || streq(method, "stopLoad") || streq(method, "goBack") || streq(method, "goForward") ||
-               streq(method, "invalidate")) {
+    } else if (streq(method, "setScrollDelta")) {
+        return on_set_scroll_delta(args, response_handle);
+    } else if (streq(method, "setClientFocus")) {
+        return on_set_client_focus(args, response_handle);
+    } else if (streq(method, "executeJavaScript")) {
+        return on_execute_javascript(args, response_handle);
+    } else if (streq(method, "imeCommitText") || streq(method, "imeSetComposition")) {
+        return on_ime_text(method, args, response_handle);
+    } else if (streq(method, "quit")) {
+        return on_quit(response_handle);
+    } else if (streq(method, "cursorMove") || streq(method, "cursorDragging") || streq(method, "cursorClickDown") ||
+               streq(method, "cursorClickUp")) {
+        return on_cursor_event(method, args, response_handle);
+    } else if (streq(method, "reload") || streq(method, "goBack") || streq(method, "goForward")) {
         return on_navigation(method, args, response_handle);
     }
 
+    // Not implemented, on purpose:
+    //   evaluateJavascript, setJavaScriptChannels, sendJavaScriptChannelCallBack
+    //     -- need a CefRenderProcessHandler in the subprocess helper plus IPC to
+    //        get values back out of V8.
+    //   openDevTools -- needs a real window to put the inspector in.
+    //   setCookie, deleteCookie, visitAllCookies, visitUrlCookies
+    //     -- straightforward to add on top of CefCookieManager, just not done.
     return platch_respond_not_implemented(response_handle);
 }
 
@@ -1119,15 +1162,14 @@ enum plugin_init_result webview_cef_init(struct flutterpi *flutterpi, void **use
         return PLUGIN_INIT_RESULT_ERROR;
     }
 
-    // CEF itself is only started on the first `init`/`create` call, so a kiosk
+    // CEF itself is only started on the first `init`/`create` call, so an app
     // that never opens a webview doesn't pay for Chromium's ~150MB of RAM.
     //
     // Plugins are initialized before the flutter engine is created though, so
     // starting CEF here means its helper processes are forked out of a process
     // that isn't heavily threaded yet, and Chromium's signal handlers are
     // installed before the engine's. If lazy initialization ever turns out to be
-    // flaky, set FLUTTERPI_CEF_EAGER_INIT=1 and configure CEF through the
-    // FLUTTERPI_CEF_* environment variables instead of through `init`.
+    // flaky, set FLUTTERPI_CEF_EAGER_INIT=1.
     if (getenv("FLUTTERPI_CEF_EAGER_INIT") != NULL) {
         ok = ensure_cef_initialized(NULL);
         if (ok != 0) {
@@ -1154,18 +1196,15 @@ void webview_cef_deinit(struct flutterpi *flutterpi, void *userdata) {
     for (struct webview *wv = plugin.webviews, *next = NULL; wv != NULL; wv = next) {
         next = wv->next;
 
-        wv->disposing = true;
+        wv->closing = true;
+        webview_release_textures(wv);
 
-        if (wv->texture != NULL) {
-            texture_destroy(wv->texture);
-            wv->texture = NULL;
-        }
         if (wv->browser != NULL) {
             wvcef_browser_close(wv->browser);
         }
     }
 
-    if (plugin.cef_initialized) {
+    if (wvcef_is_initialized()) {
         // 200 * 10ms = 2s worth of patience.
         for (int i = 0; i < 200 && wvcef_n_live_browsers() > 0; i++) {
             wvcef_do_message_loop_work();
@@ -1182,8 +1221,6 @@ void webview_cef_deinit(struct flutterpi *flutterpi, void *userdata) {
         } else {
             wvcef_shutdown();
         }
-
-        plugin.cef_initialized = false;
     }
 
     // on_browser_closed already freed everything that actually closed.
@@ -1203,4 +1240,4 @@ void webview_cef_deinit(struct flutterpi *flutterpi, void *userdata) {
     pthread_mutex_destroy(&plugin.pump_mutex);
 }
 
-FLUTTERPI_PLUGIN("webview cef", webview_cef_plugin, webview_cef_init, webview_cef_deinit)
+FLUTTERPI_PLUGIN("webview_cef", webview_cef_plugin, webview_cef_init, webview_cef_deinit)

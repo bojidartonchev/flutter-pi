@@ -6,19 +6,12 @@
  *
  * This file must not include any flutter-pi header -- see cef_bridge.h for why.
  *
- * Coordinate systems
- * ------------------
- * Everything crossing this boundary (view size, pointer positions) is in
- * *logical* pixels, which is what Flutter hands us. CEF works the same way:
- * CefRenderHandler::GetViewRect is logical, and CEF multiplies it by the scale
- * factor from GetScreenInfo to get the size of the pixel buffer it passes to
- * OnPaint. So the only place physical pixels appear is on_paint().
- *
- * Copyright (c) 2026, EGT
+ * Copyright (c) 2026, Bojidar Tonchev <bojidar.tonchev@gmail.com>
  */
 
 #include "cef_bridge.h"
 
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -158,7 +151,7 @@ public:
         }
     }
 
-    /// A kiosk has nowhere to put a second window, so load target=_blank and
+    /// There is nowhere to put a second window, so load target=_blank and
     /// window.open() URLs into this view instead of spawning a popup browser
     /// that nothing would ever render.
     bool OnBeforePopup(
@@ -199,8 +192,8 @@ public:
         (void) browser;
         rect.x = 0;
         rect.y = 0;
-        rect.width = logical_width_;
-        rect.height = logical_height_;
+        rect.width = logical_width_ > 0 ? logical_width_ : 1;
+        rect.height = logical_height_ > 0 ? logical_height_ : 1;
     }
 
     bool GetScreenInfo(CefRefPtr<CefBrowser> browser, CefScreenInfo &screen_info) override {
@@ -210,7 +203,7 @@ public:
         screen_info.depth = 32;
         screen_info.depth_per_component = 8;
         screen_info.is_monochrome = 0;
-        screen_info.rect = CefRect(0, 0, logical_width_, logical_height_);
+        screen_info.rect = CefRect(0, 0, logical_width_ > 0 ? logical_width_ : 1, logical_height_ > 0 ? logical_height_ : 1);
         screen_info.available_rect = screen_info.rect;
         return true;
     }
@@ -294,18 +287,39 @@ public:
     ) override {
         (void) browser;
         (void) cursor;
-        (void) type;
         (void) custom_cursor_info;
-        // No window system to set a cursor on. Swallow it.
+
+        if (callbacks_.on_cursor_changed != nullptr) {
+            callbacks_.on_cursor_changed(userdata_, static_cast<int>(type));
+        }
+
+        // Return true to say we handled it -- there is no window system for CEF
+        // to set a cursor on.
         return true;
     }
 
     // -- CefLoadHandler -----------------------------------------------------
-    void OnLoadingStateChange(CefRefPtr<CefBrowser> browser, bool is_loading, bool can_go_back, bool can_go_forward) override {
+    void OnLoadStart(CefRefPtr<CefBrowser> browser, CefRefPtr<CefFrame> frame, TransitionType transition_type) override {
         (void) browser;
-        if (callbacks_.on_loading_state_changed != nullptr) {
-            callbacks_.on_loading_state_changed(userdata_, is_loading, can_go_back, can_go_forward);
+        (void) transition_type;
+
+        if (frame == nullptr || !frame->IsMain() || callbacks_.on_load_start == nullptr) {
+            return;
         }
+
+        const std::string url = frame->GetURL().ToString();
+        callbacks_.on_load_start(userdata_, url.c_str());
+    }
+
+    void OnLoadEnd(CefRefPtr<CefBrowser> browser, CefRefPtr<CefFrame> frame, int http_status_code) override {
+        (void) browser;
+
+        if (frame == nullptr || !frame->IsMain() || callbacks_.on_load_end == nullptr) {
+            return;
+        }
+
+        const std::string url = frame->GetURL().ToString();
+        callbacks_.on_load_end(userdata_, url.c_str(), http_status_code);
     }
 
     void OnLoadError(
@@ -349,6 +363,37 @@ public:
             const std::string str = title.ToString();
             callbacks_.on_title_changed(userdata_, str.c_str());
         }
+    }
+
+    bool OnTooltip(CefRefPtr<CefBrowser> browser, CefString &text) override {
+        (void) browser;
+
+        if (callbacks_.on_tooltip != nullptr) {
+            const std::string str = text.ToString();
+            callbacks_.on_tooltip(userdata_, str.c_str());
+        }
+
+        // The dart side draws the tooltip.
+        return true;
+    }
+
+    bool OnConsoleMessage(
+        CefRefPtr<CefBrowser> browser,
+        cef_log_severity_t level,
+        const CefString &message,
+        const CefString &source,
+        int line
+    ) override {
+        (void) browser;
+
+        if (callbacks_.on_console_message != nullptr) {
+            const std::string message_str = message.ToString();
+            const std::string source_str = source.ToString();
+            callbacks_.on_console_message(userdata_, static_cast<int>(level), message_str.c_str(), source_str.c_str(), line);
+        }
+
+        // Let CEF log it as well.
+        return false;
     }
 
     // -- Used by the C API --------------------------------------------------
@@ -451,15 +496,6 @@ cef_log_severity_t to_log_severity(int severity) {
         case 5: return LOGSEVERITY_FATAL;
         case 99: return LOGSEVERITY_DISABLE;
         default: return LOGSEVERITY_DEFAULT;
-    }
-}
-
-cef_mouse_button_type_t to_cef_button(enum wvcef_pointer_button button) {
-    switch (button) {
-        case WVCEF_BUTTON_MIDDLE: return MBT_MIDDLE;
-        case WVCEF_BUTTON_RIGHT: return MBT_RIGHT;
-        case WVCEF_BUTTON_LEFT:
-        default: return MBT_LEFT;
     }
 }
 
@@ -681,6 +717,14 @@ struct wvcef_browser *wvcef_browser_create(
     return handle;
 }
 
+int wvcef_browser_get_id(struct wvcef_browser *browser) {
+    CefRefPtr<CefBrowser> b = browser_of(browser);
+    if (b == nullptr) {
+        return 0;
+    }
+    return b->GetIdentifier();
+}
+
 void wvcef_browser_close(struct wvcef_browser *browser) {
     if (browser == nullptr || browser->client == nullptr || browser->close_requested) {
         return;
@@ -711,13 +755,6 @@ void wvcef_browser_reload(struct wvcef_browser *browser, bool ignore_cache) {
         b->ReloadIgnoreCache();
     } else {
         b->Reload();
-    }
-}
-
-void wvcef_browser_stop_load(struct wvcef_browser *browser) {
-    CefRefPtr<CefBrowser> b = browser_of(browser);
-    if (b != nullptr) {
-        b->StopLoad();
     }
 }
 
@@ -765,14 +802,7 @@ void wvcef_browser_set_focus(struct wvcef_browser *browser, bool focused) {
     }
 }
 
-void wvcef_browser_invalidate(struct wvcef_browser *browser) {
-    CefRefPtr<CefBrowser> b = browser_of(browser);
-    if (b != nullptr) {
-        b->GetHost()->Invalidate(PET_VIEW);
-    }
-}
-
-void wvcef_browser_send_mouse_move(struct wvcef_browser *browser, int x, int y, bool mouse_leave, uint32_t modifiers) {
+void wvcef_browser_send_mouse_move(struct wvcef_browser *browser, int x, int y, bool dragging) {
     CefRefPtr<CefBrowser> b = browser_of(browser);
     if (b == nullptr) {
         return;
@@ -781,20 +811,12 @@ void wvcef_browser_send_mouse_move(struct wvcef_browser *browser, int x, int y, 
     CefMouseEvent event;
     event.x = x;
     event.y = y;
-    event.modifiers = modifiers;
+    event.modifiers = dragging ? EVENTFLAG_LEFT_MOUSE_BUTTON : EVENTFLAG_NONE;
 
-    b->GetHost()->SendMouseMoveEvent(event, mouse_leave);
+    b->GetHost()->SendMouseMoveEvent(event, false);
 }
 
-void wvcef_browser_send_mouse_button(
-    struct wvcef_browser *browser,
-    int x,
-    int y,
-    enum wvcef_pointer_button button,
-    bool is_up,
-    int click_count,
-    uint32_t modifiers
-) {
+void wvcef_browser_send_mouse_click(struct wvcef_browser *browser, int x, int y, bool is_up) {
     CefRefPtr<CefBrowser> b = browser_of(browser);
     if (b == nullptr) {
         return;
@@ -803,12 +825,12 @@ void wvcef_browser_send_mouse_button(
     CefMouseEvent event;
     event.x = x;
     event.y = y;
-    event.modifiers = modifiers;
+    event.modifiers = EVENTFLAG_LEFT_MOUSE_BUTTON;
 
-    b->GetHost()->SendMouseClickEvent(event, to_cef_button(button), is_up, click_count > 0 ? click_count : 1);
+    b->GetHost()->SendMouseClickEvent(event, MBT_LEFT, is_up, 1);
 }
 
-void wvcef_browser_send_mouse_wheel(struct wvcef_browser *browser, int x, int y, int delta_x, int delta_y, uint32_t modifiers) {
+void wvcef_browser_send_mouse_wheel(struct wvcef_browser *browser, int x, int y, int delta_x, int delta_y) {
     CefRefPtr<CefBrowser> b = browser_of(browser);
     if (b == nullptr) {
         return;
@@ -817,68 +839,41 @@ void wvcef_browser_send_mouse_wheel(struct wvcef_browser *browser, int x, int y,
     CefMouseEvent event;
     event.x = x;
     event.y = y;
-    event.modifiers = modifiers;
+    event.modifiers = EVENTFLAG_NONE;
 
-    b->GetHost()->SendMouseWheelEvent(event, delta_x, delta_y);
+    // Flutter's scroll deltas grow downwards and are much finer grained than a
+    // mouse wheel click. Same conversion the webview_cef package applies on its
+    // non-Apple platforms, so scrolling feels identical.
+    b->GetHost()->SendMouseWheelEvent(event, delta_x * 10, -delta_y * 10);
 }
 
-void wvcef_browser_send_touch(struct wvcef_browser *browser, int pointer_id, int x, int y, enum wvcef_touch_phase phase, uint32_t modifiers) {
+namespace {
+
+/// CEF's "no range" sentinel, the same one cefclient uses for IME input.
+CefRange invalid_range() {
+    return CefRange(UINT32_MAX, UINT32_MAX);
+}
+
+}  // namespace
+
+void wvcef_browser_ime_commit_text(struct wvcef_browser *browser, const char *text) {
     CefRefPtr<CefBrowser> b = browser_of(browser);
-    if (b == nullptr) {
+    if (b == nullptr || text == nullptr) {
         return;
     }
 
-    CefTouchEvent event;
-    event.id = pointer_id;
-    event.x = static_cast<float>(x);
-    event.y = static_cast<float>(y);
-    event.radius_x = 0;
-    event.radius_y = 0;
-    event.rotation_angle = 0;
-    event.pressure = 1.0f;
-    event.modifiers = modifiers;
-    event.pointer_type = CEF_POINTER_TYPE_TOUCH;
-
-    switch (phase) {
-        case WVCEF_TOUCH_PRESSED: event.type = CEF_TET_PRESSED; break;
-        case WVCEF_TOUCH_MOVED: event.type = CEF_TET_MOVED; break;
-        case WVCEF_TOUCH_CANCELLED: event.type = CEF_TET_CANCELLED; break;
-        case WVCEF_TOUCH_RELEASED:
-        default: event.type = CEF_TET_RELEASED; break;
-    }
-
-    b->GetHost()->SendTouchEvent(event);
+    b->GetHost()->ImeCommitText(CefString(text), invalid_range(), 0);
 }
 
-void wvcef_browser_send_key(
-    struct wvcef_browser *browser,
-    enum wvcef_key_type type,
-    int windows_key_code,
-    int native_key_code,
-    uint32_t character,
-    uint32_t modifiers
-) {
+void wvcef_browser_ime_set_composition(struct wvcef_browser *browser, const char *text) {
     CefRefPtr<CefBrowser> b = browser_of(browser);
-    if (b == nullptr) {
+    if (b == nullptr || text == nullptr) {
         return;
     }
 
-    CefKeyEvent event;
-    switch (type) {
-        case WVCEF_KEY_RAWDOWN: event.type = KEYEVENT_RAWKEYDOWN; break;
-        case WVCEF_KEY_DOWN: event.type = KEYEVENT_KEYDOWN; break;
-        case WVCEF_KEY_UP: event.type = KEYEVENT_KEYUP; break;
-        case WVCEF_KEY_CHAR:
-        default: event.type = KEYEVENT_CHAR; break;
-    }
+    const CefString composition(text);
+    const std::vector<CefCompositionUnderline> underlines;
+    const uint32_t cursor = static_cast<uint32_t>(composition.length());
 
-    event.modifiers = modifiers;
-    event.windows_key_code = windows_key_code;
-    event.native_key_code = native_key_code;
-    event.is_system_key = 0;
-    event.character = static_cast<char16_t>(character);
-    event.unmodified_character = static_cast<char16_t>(character);
-    event.focus_on_editable_field = 0;
-
-    b->GetHost()->SendKeyEvent(event);
+    b->GetHost()->ImeSetComposition(composition, underlines, invalid_range(), CefRange(cursor, cursor));
 }

@@ -23,7 +23,15 @@
  * The single exception is the pump-scheduling callback, which CEF may invoke
  * from any thread.
  *
- * Copyright (c) 2026, EGT
+ * Coordinate systems
+ * ------------------
+ * Everything crossing this boundary -- view size, pointer positions -- is in
+ * *logical* pixels, which is what flutter hands us. CEF works the same way:
+ * CefRenderHandler::GetViewRect is logical, and CEF multiplies it by the scale
+ * factor from GetScreenInfo to get the size of the pixel buffer it passes to
+ * OnPaint. So physical pixels only ever appear in on_paint().
+ *
+ * Copyright (c) 2026, Bojidar Tonchev <bojidar.tonchev@gmail.com>
  */
 
 #ifndef _FLUTTERPI_SRC_PLUGINS_WEBVIEW_CEF_CEF_BRIDGE_H
@@ -39,49 +47,37 @@ extern "C" {
 
 struct wvcef_browser;
 
-enum wvcef_pointer_button {
-    WVCEF_BUTTON_LEFT = 0,
-    WVCEF_BUTTON_MIDDLE = 1,
-    WVCEF_BUTTON_RIGHT = 2,
-};
-
-enum wvcef_touch_phase {
-    WVCEF_TOUCH_RELEASED = 0,
-    WVCEF_TOUCH_PRESSED = 1,
-    WVCEF_TOUCH_MOVED = 2,
-    WVCEF_TOUCH_CANCELLED = 3,
-};
-
-enum wvcef_key_type {
-    WVCEF_KEY_RAWDOWN = 0,
-    WVCEF_KEY_DOWN = 1,
-    WVCEF_KEY_UP = 2,
-    WVCEF_KEY_CHAR = 3,
-};
-
 /**
  * @brief Callbacks a webview instance delivers to the host (plugin.c).
  *
  * All of these are invoked on the platform thread. Strings are only valid for
- * the duration of the call.
+ * the duration of the call. Every one of them may be NULL.
  */
 struct wvcef_host_callbacks {
     /**
      * @brief A new frame was rendered.
      *
-     * @param buffer BGRA8888 (byte order B,G,R,A), @ref width * @ref height * 4 bytes,
-     *               tightly packed. Only valid during the call.
+     * @param buffer BGRA8888 (byte order B,G,R,A), @ref width * @ref height * 4
+     *               bytes, tightly packed. Only valid during the call.
      * @param width,height Size of the buffer in *physical* pixels.
      */
     void (*on_paint)(void *userdata, const void *buffer, int width, int height);
 
-    void (*on_loading_state_changed)(void *userdata, bool is_loading, bool can_go_back, bool can_go_forward);
-    void (*on_url_changed)(void *userdata, const char *url);
-    void (*on_title_changed)(void *userdata, const char *title);
+    void (*on_load_start)(void *userdata, const char *url);
+    void (*on_load_end)(void *userdata, const char *url, int http_status_code);
     void (*on_load_error)(void *userdata, int error_code, const char *error_text, const char *failed_url);
 
-    /// Called once the underlying browser is gone. After this, the
-    /// struct wvcef_browser handle must not be used anymore.
+    void (*on_url_changed)(void *userdata, const char *url);
+    void (*on_title_changed)(void *userdata, const char *title);
+    void (*on_tooltip)(void *userdata, const char *text);
+    void (*on_console_message)(void *userdata, int level, const char *message, const char *source, int line);
+
+    /// @param cursor_type a cef_cursor_type_t value.
+    void (*on_cursor_changed)(void *userdata, int cursor_type);
+
+    /// Called once the underlying browser is gone. After this returns, the
+    /// struct wvcef_browser handle must not be used anymore -- the bridge frees
+    /// it.
     void (*on_closed)(void *userdata);
 };
 
@@ -120,9 +116,9 @@ struct wvcef_init_options {
     /// 5 = fatal, 99 = disable.
     int log_severity;
 
-    /// Extra command line switches, e.g. "disable-gpu" or "ozone-platform=headless".
-    /// Written without the leading "--". A "key=value" entry becomes a switch
-    /// with a value, a bare "key" becomes a boolean switch.
+    /// Extra command line switches, written without the leading "--". A
+    /// "key=value" entry becomes a switch with a value, a bare "key" a boolean
+    /// switch.
     const char *const *switches;
     size_t n_switches;
 
@@ -139,13 +135,14 @@ struct wvcef_init_options {
 int wvcef_execute_subprocess(int argc, char **argv);
 
 /**
- * @brief Initialize CEF. Must be called exactly once, on the platform thread.
+ * @brief Initialize CEF. Must be called on the platform thread. Calling it more
+ * than once is a no-op.
  *
  * @returns 0 on success, an errno-style code otherwise.
  */
 int wvcef_initialize(const struct wvcef_init_options *options);
 
-/// True if @ref wvcef_initialize succeeded and @ref wvcef_shutdown wasn't called yet.
+/// True if @ref wvcef_initialize succeeded and @ref wvcef_shutdown hasn't run yet.
 bool wvcef_is_initialized(void);
 
 /// Let CEF do some work. Call from the platform thread, whenever the
@@ -155,15 +152,15 @@ void wvcef_do_message_loop_work(void);
 /// Number of browsers that were created and haven't fully closed yet.
 int wvcef_n_live_browsers(void);
 
-/// Tears CEF down. All browsers must have been closed before.
+/// Tears CEF down. All browsers must have been closed before. CEF cannot be
+/// initialized again afterwards, in this process.
 void wvcef_shutdown(void);
 
 /**
  * @brief Create an off-screen browser.
  *
- * @param width,height Size in *logical* pixels (what Flutter calls logical pixels
- *                     and CSS calls px). The buffer delivered to on_paint is
- *                     width*device_pixel_ratio by height*device_pixel_ratio.
+ * @param width,height Size in logical pixels. The buffer delivered to on_paint
+ *                     is width*device_pixel_ratio by height*device_pixel_ratio.
  * @param device_pixel_ratio Scale factor reported to the page (window.devicePixelRatio).
  * @param frame_rate Maximum frames per second CEF will render, 1..60.
  * @returns The browser, or NULL on failure.
@@ -178,13 +175,16 @@ struct wvcef_browser *wvcef_browser_create(
     void *userdata
 );
 
+/// CEF's browser identifier, which is what the dart side of the webview_cef
+/// package uses to address a webview. 0 if the browser is already gone.
+int wvcef_browser_get_id(struct wvcef_browser *browser);
+
 /// Asks the browser to close. @ref wvcef_host_callbacks::on_closed is called
 /// once it's really gone; only then is the handle released.
 void wvcef_browser_close(struct wvcef_browser *browser);
 
 void wvcef_browser_load_url(struct wvcef_browser *browser, const char *url);
 void wvcef_browser_reload(struct wvcef_browser *browser, bool ignore_cache);
-void wvcef_browser_stop_load(struct wvcef_browser *browser);
 void wvcef_browser_go_back(struct wvcef_browser *browser);
 void wvcef_browser_go_forward(struct wvcef_browser *browser);
 void wvcef_browser_execute_javascript(struct wvcef_browser *browser, const char *code);
@@ -194,30 +194,16 @@ void wvcef_browser_resize(struct wvcef_browser *browser, int width, int height, 
 
 void wvcef_browser_set_focus(struct wvcef_browser *browser, bool focused);
 
-/// Ask CEF to re-send the whole frame via on_paint.
-void wvcef_browser_invalidate(struct wvcef_browser *browser);
+/// Feeds UTF-8 text to whatever has focus in the page. This is how the
+/// webview_cef dart side delivers typed text.
+void wvcef_browser_ime_commit_text(struct wvcef_browser *browser, const char *text);
+void wvcef_browser_ime_set_composition(struct wvcef_browser *browser, const char *text);
 
 /// Coordinates are in logical pixels, relative to the webview's top left corner.
-void wvcef_browser_send_mouse_move(struct wvcef_browser *browser, int x, int y, bool mouse_leave, uint32_t modifiers);
-void wvcef_browser_send_mouse_button(
-    struct wvcef_browser *browser,
-    int x,
-    int y,
-    enum wvcef_pointer_button button,
-    bool is_up,
-    int click_count,
-    uint32_t modifiers
-);
-void wvcef_browser_send_mouse_wheel(struct wvcef_browser *browser, int x, int y, int delta_x, int delta_y, uint32_t modifiers);
-void wvcef_browser_send_touch(struct wvcef_browser *browser, int pointer_id, int x, int y, enum wvcef_touch_phase phase, uint32_t modifiers);
-void wvcef_browser_send_key(
-    struct wvcef_browser *browser,
-    enum wvcef_key_type type,
-    int windows_key_code,
-    int native_key_code,
-    uint32_t character,
-    uint32_t modifiers
-);
+/// @param dragging true to report the left button as held down.
+void wvcef_browser_send_mouse_move(struct wvcef_browser *browser, int x, int y, bool dragging);
+void wvcef_browser_send_mouse_click(struct wvcef_browser *browser, int x, int y, bool is_up);
+void wvcef_browser_send_mouse_wheel(struct wvcef_browser *browser, int x, int y, int delta_x, int delta_y);
 
 #ifdef __cplusplus
 }

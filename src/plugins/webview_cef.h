@@ -2,18 +2,21 @@
 /*
  * CEF powered webview plugin
  *
- * Renders web pages off-screen with the Chromium Embedded Framework and exposes
- * them to flutter as external textures, so they can be composited into the
- * flutter widget tree with a `Texture` widget.
+ * Implements the platform side of the `webview_cef` pub package
+ * (https://pub.dev/packages/webview_cef), so flutter apps can embed web pages
+ * on flutter-pi with the same dart code they use on desktop.
  *
- * See src/plugins/webview_cef/README.md for the platform channel protocol.
+ * Pages are rendered off-screen by the Chromium Embedded Framework and handed to
+ * flutter as external textures, since flutter-pi has no platform views.
  *
- * Copyright (c) 2026, EGT
+ * See src/plugins/webview_cef/README.md.
+ *
+ * Copyright (c) 2026, Bojidar Tonchev <bojidar.tonchev@gmail.com>
  */
 
 #ifndef _FLUTTERPI_SRC_PLUGINS_WEBVIEW_CEF_H
 #define _FLUTTERPI_SRC_PLUGINS_WEBVIEW_CEF_H
 
-#define WEBVIEW_CEF_CHANNEL "egt/webview"
+#define WEBVIEW_CEF_CHANNEL "webview_cef"
 
 #endif  // _FLUTTERPI_SRC_PLUGINS_WEBVIEW_CEF_H

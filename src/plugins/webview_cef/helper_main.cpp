@@ -10,7 +10,7 @@
  *
  * flutter-pi points CefSettings::browser_subprocess_path at this binary.
  *
- * Copyright (c) 2026, EGT
+ * Copyright (c) 2026, Bojidar Tonchev <bojidar.tonchev@gmail.com>
  */
 
 #include "cef_bridge.h"

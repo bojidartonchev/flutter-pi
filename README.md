@@ -426,6 +426,19 @@ To use the printing plugin, just rebuild flutter-pi (delete your build folder an
 
 And then, just use the stuff in the official [printing](https://pub.dev/packages/printing) package.
 
+### webview
+The webview plugin embeds web pages into your app using the [Chromium Embedded Framework](https://bitbucket.org/chromiumembedded/cef). It implements the platform side of the [webview_cef](https://pub.dev/packages/webview_cef) package, so the dart code is the same one you'd write for desktop.
+
+It's off by default, because it needs a CEF binary distribution:
+
+1. Download one for your architecture from [CEF Automated Builds](https://cef-builds.spotifycdn.com) (the "Minimal Distribution" is enough) and unpack it. CEF 120 or newer.
+2. Build `libcef_dll_wrapper` from the sources in that distribution — CEF is meant to be wrapped with your own compiler.
+3. Configure flutter-pi with `-DBUILD_WEBVIEW_CEF_PLUGIN=ON -DCEF_ROOT=<path to the distribution>`.
+
+Pages are rendered off-screen and shown as flutter external textures, since flutter-pi has no platform views. Chromium runs with `--ozone-platform=headless --disable-gpu`, so page compositing happens on the CPU — fine for forms and text, not for WebGL.
+
+See [src/plugins/webview_cef/README.md](src/plugins/webview_cef/README.md) for the runtime configuration, the implemented channel methods and the known limitations.
+
 ## 📊 Performance
 ### Graphics Performance
 Graphics performance is actually pretty good. With most of the apps inside the `flutter SDK -> examples -> catalog` directory I get smooth 50-60fps on the Pi 4 2GB and Pi 3 A+.
@@ -446,6 +459,7 @@ This is why I created my own (userspace) touchscreen driver, for improved latenc
 | dart_periphery ([package](https://pub.dev/packages/dart_periphery)) ([repo](https://github.com/pezi/dart_periphery)) | 🖨 peripherals | [Peter Sauer](https://github.com/pezi/) | All-in-one package GPIO, I2C, SPI, Serial, PWM, Led, MMIO support using c-periphery. |
 | flutterpi_gstreamer_video_player ([package](https://pub.dev/packages/flutterpi_gstreamer_video_player)) ([repo](https://github.com/ardera/flutter_packages/tree/main/packages/flutterpi_gstreamer_video_player)) | ⏯️ multimedia | Hannes Winkler | Official video player implementation for flutter-pi. See [GStreamer video player](#gstreamer-video-player) section above. |
 | printing ([package](https://pub.dev/packages/printing)) ([repo](https://github.com/DavBfr/dart_pdf)) | 🖨 peripherals | David PHAM-VAN | Generate and print documents to android or ios compatible printers. See [printing](#printing) section above. |
+| webview_cef ([package](https://pub.dev/packages/webview_cef)) ([repo](https://github.com/hlwhl/webview_cef)) | 🌐 web | [hlwhl](https://github.com/hlwhl) | Embed web pages using the Chromium Embedded Framework. See [webview](#webview) section above. |
 
 ## 💬 Discord
 There a `#custom-embedders` channel on the [flutter discord](https://github.com/flutter/flutter/wiki/Chat) which you can use if you have any questions regarding flutter-pi or generally, anything related to embedding the engine for which you don't want to open issue about or write an email.
