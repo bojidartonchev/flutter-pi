@@ -22,16 +22,12 @@
 #include "include/cef_client.h"
 #include "include/cef_version.h"
 
-// CEF 120 renamed the int64/uint64 typedefs to the standard int64_t/uint64_t,
-// which changes the signature of OnScheduleMessagePumpWork. Rather than letting
-// that surface as a confusing "marked override but does not override" error,
-// fail loudly here.
-//
-// NOTE: CEF 126 added an `int popup_id` parameter to
-// CefLifeSpanHandler::OnBeforePopup. If you bump CEF past 125, that override
-// below needs the extra parameter.
-#if CEF_VERSION_MAJOR < 120
-    #error "The webview_cef plugin requires CEF 120 or newer."
+// Written against CEF 132. Two older API differences would otherwise surface as
+// confusing "marked override but does not override" errors, so fail loudly
+// instead: CEF 120 renamed the int64 typedef used by OnScheduleMessagePumpWork,
+// and CEF 126 added the popup_id parameter to OnBeforePopup.
+#if CEF_VERSION_MAJOR < 126
+    #error "The webview_cef plugin requires CEF 126 or newer."
 #endif
 
 #define LOG_CEF(...) fprintf(stderr, "[webview_cef] " __VA_ARGS__)
@@ -151,40 +147,24 @@ public:
         }
     }
 
-    /// There is nowhere to put a second window, so load target=_blank and
-    /// window.open() URLs into this view instead of spawning a popup browser
-    /// that nothing would ever render.
+    /// Parameters we don't use are left unnamed -- this signature is long enough
+    /// as it is.
     bool OnBeforePopup(
         CefRefPtr<CefBrowser> browser,
-        CefRefPtr<CefFrame> frame,
+        CefRefPtr<CefFrame>,
+        int /* popup_id */,
         const CefString &target_url,
-        const CefString &target_frame_name,
-        CefLifeSpanHandler::WindowOpenDisposition target_disposition,
-        bool user_gesture,
-        const CefPopupFeatures &popup_features,
-        CefWindowInfo &window_info,
-        CefRefPtr<CefClient> &client,
-        CefBrowserSettings &settings,
-        CefRefPtr<CefDictionaryValue> &extra_info,
-        bool *no_javascript_access
+        const CefString &,
+        CefLifeSpanHandler::WindowOpenDisposition,
+        bool,
+        const CefPopupFeatures &,
+        CefWindowInfo &,
+        CefRefPtr<CefClient> &,
+        CefBrowserSettings &,
+        CefRefPtr<CefDictionaryValue> &,
+        bool *
     ) override {
-        (void) frame;
-        (void) target_frame_name;
-        (void) target_disposition;
-        (void) user_gesture;
-        (void) popup_features;
-        (void) window_info;
-        (void) client;
-        (void) settings;
-        (void) extra_info;
-        (void) no_javascript_access;
-
-        if (browser != nullptr && !target_url.empty()) {
-            browser->GetMainFrame()->LoadURL(target_url);
-        }
-
-        // Cancel the popup.
-        return true;
+        return redirect_popup(browser, target_url);
     }
 
     // -- CefRenderHandler ---------------------------------------------------
@@ -411,6 +391,18 @@ public:
     }
 
 private:
+    /// There is nowhere to put a second window, so target=_blank and
+    /// window.open() load into this view instead of spawning a popup browser
+    /// that nothing would ever render.
+    bool redirect_popup(CefRefPtr<CefBrowser> browser, const CefString &target_url) {
+        if (browser != nullptr && !target_url.empty()) {
+            browser->GetMainFrame()->LoadURL(target_url);
+        }
+
+        // Cancel the popup.
+        return true;
+    }
+
     /// Draws popup_buffer_ over a copy of view_buffer_ and emits the result.
     void composite_and_emit() {
         if (view_buffer_.empty() || view_width_ <= 0 || view_height_ <= 0) {
@@ -623,7 +615,7 @@ int wvcef_initialize(const struct wvcef_init_options *options) {
 
     g_initialized = true;
     // CEF_VERSION is the only version macro that's spelled the same across
-    // releases; it reads like "120.2.7+gd3b6c37+chromium-120.0.6099.234".
+    // releases; it reads like "132.3.2+g4997b2f+chromium-132.0.6834.161".
     LOG_CEF("CEF %s initialized.\n", CEF_VERSION);
     return 0;
 }

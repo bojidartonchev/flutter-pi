@@ -75,8 +75,9 @@ cmake -B build -DBUILD_WEBVIEW_CEF_PLUGIN=ON -DCEF_ROOT=/path/to/cef_binary_..._
 stable C ABI; CEF expects you to build it yourself with your own compiler, which
 is why gcc/libstdc++ against a clang/libc++ `libcef.so` is fine.
 
-CEF 120 or newer is required; there is a version check at the top of
-`cef_bridge.cpp`.
+CEF 126 or newer is required -- that's when `OnBeforePopup` got its `popup_id`
+parameter. There is a `#error` guarding it at the top of `cef_bridge.cpp`.
+Developed against 132.3.2.
 
 Two more cache variables describe the **target** layout:
 

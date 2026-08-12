@@ -431,7 +431,7 @@ The webview plugin embeds web pages into your app using the [Chromium Embedded F
 
 It's off by default, because it needs a CEF binary distribution:
 
-1. Download one for your architecture from [CEF Automated Builds](https://cef-builds.spotifycdn.com) (the "Minimal Distribution" is enough) and unpack it. CEF 120 or newer.
+1. Download one for your architecture from [CEF Automated Builds](https://cef-builds.spotifycdn.com) (the "Minimal Distribution" is enough) and unpack it. CEF 126 or newer.
 2. Build `libcef_dll_wrapper` from the sources in that distribution — CEF is meant to be wrapped with your own compiler.
 3. Configure flutter-pi with `-DBUILD_WEBVIEW_CEF_PLUGIN=ON -DCEF_ROOT=<path to the distribution>`.
 
