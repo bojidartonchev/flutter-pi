@@ -97,22 +97,41 @@
     } while (0)
 
 /// Chromium switches we pass unless FLUTTERPI_CEF_NO_DEFAULT_SWITCHES is set.
-/// The important ones are the first three: flutter-pi owns the DRM master and
-/// there is no X server or wayland compositor to talk to, so Chromium has to use
-/// the headless ozone platform and must not bring up a GPU stack of its own.
 static const char *const default_switches[] = {
+    // There is no X server and no wayland compositor to talk to, so Chromium has
+    // to use the headless ozone platform.
     "ozone-platform=headless",
-    "disable-gpu",
-    "disable-gpu-compositing",
-    // Chromium stopped falling back to software WebGL on its own around M120: it
-    // now refuses to create the context and says, in the log, to pass this flag.
-    // Since --disable-gpu above leaves software as the only option, WebGL content
-    // gets no context at all without it -- and a page that renders through WebGL
-    // then loads completely and draws nothing, which is a confusing way to fail.
-    // The "unsafe" is about running untrusted shaders through a software
-    // rasteriser; a kiosk pointed at a known page is exactly the trusted case the
-    // flag exists for.
+
+    // Render through ANGLE on native EGL/GLES, which on a KMS target means Mesa
+    // on a render node -- /dev/dri/renderD128 needs no DRM master, so Chromium
+    // gets the GPU while flutter-pi keeps card0.
+    //
+    // Worth being explicit about why this matters, because the failure is silent
+    // and expensive: left to itself Chromium ends up on SwiftShader and
+    // rasterises WebGL on the CPU. Measured on a Celeron J6412, a WebGL slot
+    // game ran at about 3fps with SwiftShader's four worker threads saturating
+    // all four cores, against ~3% CPU in the GPU process once Mesa's iris driver
+    // was actually being used. Nothing in the page or the plugin looks wrong
+    // either way -- it just renders slowly.
+    //
+    // Necessary but not sufficient: see the EGL_PLATFORM note in
+    // ensure_cef_initialized(), without which Mesa goes looking for an X display,
+    // fails, and Chromium quietly falls back to SwiftShader anyway.
+    "use-gl=angle",
+    "use-angle=gl-egl",
+
+    // An embedded GPU won't be on Chromium's list of known-good configurations,
+    // and being absent from that list is not the same as being broken.
+    "ignore-gpu-blocklist",
+
+    // Only reached if the native EGL above doesn't come up -- no GL driver, no
+    // render node. Chromium has refused software WebGL on its own since around
+    // M120, so without this flag the fallback isn't "slow WebGL", it is a page
+    // that loads completely and draws nothing. The "unsafe" is about running
+    // untrusted shaders through a software rasteriser; a kiosk pointed at a known
+    // page is the trusted case the flag exists for.
     "enable-unsafe-swiftshader",
+
     "disable-dev-shm-usage",
     "autoplay-policy=no-user-gesture-required",
 };
@@ -766,6 +785,22 @@ static int ensure_cef_initialized(const char *user_agent) {
 
     options.switches = switches;
     options.n_switches = n_switches;
+
+    // Mesa's EGL defaults to the X11 platform, and there is no X server here. The
+    // CEF helper processes then fail eglInitialize with "Could not open the default
+    // X display" and Chromium falls back to SwiftShader, saying so nowhere except
+    // its own log -- so `use-gl=angle` above only reaches the GPU with this set.
+    //
+    // It goes in *our* environment because CEF has no hook for a subprocess's: the
+    // helpers are forked from this process and inherit it. flutter-pi's own display
+    // is not affected. It already exists by the time any plugin is initialized, and
+    // it is created with an explicit platform -- eglGetPlatformDisplay with
+    // EGL_PLATFORM_GBM_KHR -- which EGL_PLATFORM does not override; the variable
+    // only steers the legacy eglGetDisplay().
+    //
+    // Not overwritten, so a target that wants a different EGL platform (or plain
+    // X11, if someone runs this under one) can just say so in the environment.
+    setenv("EGL_PLATFORM", "surfaceless", 0);
 
     LOG_DEBUG("Initializing CEF. runtime dir: %s, helper: %s\n", runtime_dir, options.subprocess_path);
 

@@ -155,10 +155,10 @@ painting at all, and at what size? It prints the first three frames per browser
 and then every hundredth, so it is usable on a running release build -- unlike
 `LOG_DEBUG`, which is compiled out of exactly the builds that need explaining.
 
-Level `2` prints each frame's steps, flushed as it goes, for the case where the
-platform thread stops dead: both the CEF message loop and the GL upload can
-block, and the last line printed says which call didn't return. Useful on a
-target with no debugger on it.
+Level `2` prints each frame's steps, flushed as it goes, for the case where a
+frame stops halfway: taking the texture mutex, making the EGL context current and
+`glFinish` can all block, and the last line printed says which call didn't return.
+Useful on a target with no debugger on it.
 
 `FLUTTERPI_CEF_EAGER_INIT` exists because plugins are initialized *before* the
 flutter engine is created. Starting CEF there means Chromium forks its helper
@@ -171,18 +171,57 @@ The switches passed by default:
 
 ```
 --ozone-platform=headless           there is no X server and no compositor
---disable-gpu                       don't start a GPU process next to flutter-pi
---disable-gpu-compositing
+--use-gl=angle                      ANGLE on native EGL/GLES, i.e. Mesa on a
+--use-angle=gl-egl                    render node -- see "GPU" below
+--ignore-gpu-blocklist              an embedded GPU won't be on the known-good list
+--enable-unsafe-swiftshader         software WebGL, only if the above fails
 --disable-dev-shm-usage
 --autoplay-policy=no-user-gesture-required
 ```
 
-The first three are the ones that matter. If the page stays blank, or Chromium
-dies during startup, this is the list to experiment with:
+The plugin also sets `EGL_PLATFORM=surfaceless` (without overwriting an existing
+value) before `CefInitialize`, because the GL switches above do nothing without
+it -- see "GPU". If the page stays blank, or Chromium dies during startup, this is
+the list to experiment with:
 
 ```bash
 FLUTTERPI_CEF_TRACE=1 FLUTTERPI_CEF_LOG_SEVERITY=1 FLUTTERPI_CEF_SWITCHES=enable-logging=stderr,v=1 flutter-pi --release /path/to/bundle
 ```
+
+### GPU
+
+Chromium and flutter-pi can share the GPU, and it is worth making sure they do.
+flutter-pi holds DRM master on the card node, but Chromium doesn't need master --
+it only needs a *render* node, `/dev/dri/renderD128`, which is exactly what render
+nodes are for. So the two coexist, and WebGL and canvas run on the real GPU.
+
+Getting there needs two things that are easy to miss, because missing them costs
+performance rather than correctness:
+
+1. `--use-gl=angle --use-angle=gl-egl`, so Chromium uses ANGLE over native
+   EGL/GLES instead of its bundled SwiftShader.
+2. `EGL_PLATFORM=surfaceless`, because Mesa's EGL otherwise defaults to the X11
+   platform. There is no X server, `eglInitialize` fails with *"Could not open the
+   default X display"*, and Chromium falls back to SwiftShader.
+
+That fallback is the thing to watch for. It is silent: the page loads, WebGL
+reports a working context, everything renders correctly -- just slowly, with the
+CPU doing the rasterisation. On a Celeron J6412 a WebGL slot game ran at about
+**3fps**, with SwiftShader's four worker threads saturating all four cores, and at
+full speed with **~3%** CPU in the GPU process once Mesa was actually in use.
+
+To check which one you got, on the target:
+
+```bash
+# find the GPU process, then look at what it loaded
+for p in $(pidof flutter-pi-cef-helper); do grep -aq type=gpu-process /proc/$p/cmdline && echo $p; done
+```
+
+With hardware GL that process has `/dev/dri/renderD128` among its open `fd`s and
+the Mesa driver (`iris_dri.so`, `v3d_dri.so`, ...) in its `maps`. On SwiftShader it
+has neither, its command line says `--use-angle=swiftshader-webgl`, and its hottest
+threads are named `Thread<00>`, `Thread<01>`, ... -- SwiftShader's worker pool, and
+an unmistakable signature once you have seen it.
 
 ## Implemented channel methods
 
@@ -254,12 +293,12 @@ handling, and it's the main thing left to do here.
   buffering would fix it at the cost of memory.
 - **Dirty rects are ignored**; every paint uploads the whole surface. GLES2 has
   no `GL_UNPACK_ROW_LENGTH`, so partial uploads would need a per-row loop.
-- **`--disable-gpu`**, so page compositing happens on the CPU. Fine for forms and
-  text, slow for heavy CSS animation. WebGL does work, through SwiftShader, but
-  it is software rasterisation and it costs accordingly -- and it only works
-  because of the `--enable-unsafe-swiftshader` default switch, since Chromium
-  stopped falling back to software WebGL by itself around M120. Without that
-  switch a WebGL page loads completely and then draws nothing at all.
+- **Page compositing happens on the CPU**, whatever the GPU does. CEF forces
+  `--disable-gpu-compositing` for windowless rendering unless shared textures are
+  enabled, and it does so on its own -- it shows up in the renderer command lines
+  without being passed. WebGL and canvas still get the GPU (see below); it is the
+  final compositing step that is software, plus a `ReadPixels` per frame to get
+  the result into the buffer `OnPaint` wants.
 - **Popups** (`<select>` dropdowns) are composited into the view buffer while
   they are open, which costs one extra full-frame copy per paint. Nothing is
   copied when no popup is open.
