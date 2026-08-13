@@ -656,8 +656,7 @@ static void on_browser_closed(void *userdata) {
     if (ok != 0) {
         // Nothing sane left to do: freeing it here would race the platform
         // thread, so leak it and say so.
-        LOG_ERROR("Could not post webview teardown to the platform thread: %s
-", strerror(ok));
+        LOG_ERROR("Could not post webview teardown to the platform thread: %s\n", strerror(ok));
     }
 }
 
