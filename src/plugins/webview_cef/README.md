@@ -21,13 +21,15 @@ cannot be given a window of its own. Instead:
    input of its own.
 
 ```
- dart                     flutter-pi (platform thread)                CEF
- ─────                    ─────────────────────────────               ────
- Texture(id)  ◄──── texture_push_frame ◄── on_paint ◄──────── OnPaint (BGRA)
- Listener     ────► cursorClickDown ──────► SendMouseClickEvent ────►
-                    flutterpi_post_platform_task_with_time
-                             └────► CefDoMessageLoopWork ◄── OnScheduleMessagePumpWork
+ dart                  flutter-pi (platform thread)          CEF (UI thread)
+ ─────                 ─────────────────────────────         ───────────────
+ Texture(id) ◄─── texture_push_frame ◄── on_paint ◄───────── OnPaint (BGRA)
+ Listener    ───► cursorClickDown ─────► SendMouseClickEvent ────►
+                  webview list, wv->browser ◄── post ◄─────── OnBeforeClose
 ```
+
+The frame arrives on CEF's thread and is uploaded there; only the teardown has to
+be handed back, because the webview list belongs to the platform thread.
 
 ### Threading
 
@@ -50,6 +52,17 @@ Only one CEF call has to be marshalled. `CefBrowser` and `CefBrowserHost` are
 documented as callable from any browser process thread, which covers input,
 resize, navigation and close; `CreateBrowserSync` is the exception, so the bridge
 posts it to the UI thread and waits for the browser id the channel reply needs.
+
+The `wvcef_browser` handle is owned by the plugin, not the bridge, and that is
+deliberate. CEF can close a browser on its own -- a renderer crash is the usual
+reason -- and it reports that on its UI thread while the platform thread may be
+part-way through a channel call holding the same handle. A bridge that freed the
+handle from `OnBeforeClose` would pull it out from under that call, so instead the
+handle survives its browser: every call on it becomes a no-op, and the plugin
+releases it with `wvcef_browser_destroy` from the platform thread, where it is the
+only one looking. The webview itself is kept in that case, still showing its last
+frame, because the dart side holds a controller for it and would otherwise get a
+black rectangle with no explanation.
 
 ### Why not the external message pump
 

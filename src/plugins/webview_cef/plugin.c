@@ -84,10 +84,10 @@
 
 /// FLUTTERPI_CEF_TRACE=2: every frame, step by step, unbuffered.
 ///
-/// This exists to find out where the platform thread stopped, on a device with no
-/// debugger and no package feed to put one on. Both things it steps through -- the
-/// CEF message loop and the GL upload -- can block, and the difference matters:
-/// the last line printed names the call that didn't come back.
+/// This exists to find out where a frame stopped, on a device with no debugger and
+/// no package feed to put one on. Each step of the upload can block -- taking
+/// gl_mutex, making the context current, glFinish -- and which one matters, so the
+/// last line printed names the call that didn't come back.
 #define TRACE2(...)                                        \
     do {                                                   \
         if (plugin.trace_level >= 2) {                     \
@@ -390,23 +390,22 @@ static void on_paint(void *userdata, const void *buffer, int width, int height) 
 
     wv->n_frames++;
 
-    {
-        // The first frames are what you want to see; after that a heartbeat is
-        // enough, since 30fps of this would drown out everything else.
-        if (wv->n_frames <= 3 || wv->n_frames % 100 == 0) {
-            TRACE(
-                "paint %" PRIu64 ": browser %d, %dx%d px, texture %" PRId64 "%s\n",
-                wv->n_frames,
-                wv->browser_id,
-                width,
-                height,
-                wv->texture_id,
-                wv->texture == NULL ? " -- DROPPED, no texture" : ""
-            );
-        }
-    }
-
     pthread_mutex_lock(&plugin.gl_mutex);
+
+    // The first frames are what you want to see; after that a heartbeat is enough,
+    // since 30fps of this would drown out everything else. Under the lock because
+    // of wv->texture, which the platform thread clears from under us on close.
+    if (wv->n_frames <= 3 || wv->n_frames % 100 == 0) {
+        TRACE(
+            "paint %" PRIu64 ": browser %d, %dx%d px, texture %" PRId64 "%s\n",
+            wv->n_frames,
+            wv->browser_id,
+            width,
+            height,
+            wv->texture_id,
+            wv->texture == NULL ? " -- DROPPED, no texture" : ""
+        );
+    }
 
     // Closed while a frame was in flight.
     if (wv->texture == NULL || width <= 0 || height <= 0) {
@@ -525,6 +524,12 @@ clear_context:
 //
 // The webview_cef dart side keys everything off the CEF browser id and reads the
 // arguments out of a map.
+//
+// These all run on CEF's UI thread. That is fine because they pass no response
+// callback: platch_send then only encodes into a local buffer and hands it to
+// flutterpi_send_platform_message, which copies the message and posts it to the
+// platform thread. Passing a callback would take platch_send's response-handle
+// path instead, which is documented as not working off the platform thread.
 // ---------------------------------------------------------------------------
 
 static void send_event(int browser_id, const char *method, struct std_value *extra_keys, struct std_value *extra_values, size_t n_extra) {
@@ -630,6 +635,14 @@ static void on_console_message(void *userdata, int level, const char *message, c
 static int on_browser_closed_on_platform(void *userdata) {
     struct webview *wv = userdata;
 
+    // Releasing the handle is this thread's job precisely because this thread is
+    // the only one that reads wv->browser: doing it back on CEF's thread would
+    // invalidate the pointer under whatever channel call happens to be in flight.
+    if (wv->browser != NULL) {
+        wvcef_browser_destroy(wv->browser);
+        wv->browser = NULL;
+    }
+
     if (!wv->closing) {
         // CEF closed the browser on its own -- a crashed renderer, most likely.
         // Keep the texture around showing the last frame; the dart side still
@@ -643,14 +656,15 @@ static int on_browser_closed_on_platform(void *userdata) {
     return 0;
 }
 
-/// CEF's UI thread, from inside the browser's own teardown. The webview list
-/// belongs to the platform thread, so the actual work goes over there -- and
-/// the handle must not be touched again either way, so drop it here.
+/// CEF's UI thread, from inside the browser's own teardown.
+///
+/// Everything this has to touch -- the webview list, wv->browser, the webview
+/// itself -- belongs to the platform thread, so nothing is done here beyond
+/// getting the work over there. The webview stays readable until then; the
+/// bridge has already made every call on the handle a no-op.
 static void on_browser_closed(void *userdata) {
     struct webview *wv = userdata;
     int ok;
-
-    wv->browser = NULL;
 
     ok = flutterpi_post_platform_task(on_browser_closed_on_platform, wv);
     if (ok != 0) {
@@ -1267,13 +1281,7 @@ void webview_cef_deinit(struct flutterpi *flutterpi, void *userdata) {
 
     // Close every browser and let CEF finish the teardown. Without this,
     // CefShutdown() aborts.
-    //
-    // wvcef_browser_close() can complete synchronously, in which case
-    // on_browser_closed() unlinks and frees the webview -- so remember `next`
-    // before closing.
-    for (struct webview *wv = plugin.webviews, *next = NULL; wv != NULL; wv = next) {
-        next = wv->next;
-
+    for (struct webview *wv = plugin.webviews; wv != NULL; wv = wv->next) {
         wv->closing = true;
         webview_release_textures(wv);
 
@@ -1291,18 +1299,32 @@ void webview_cef_deinit(struct flutterpi *flutterpi, void *userdata) {
 
         if (wvcef_n_live_browsers() > 0) {
             LOG_ERROR("%d webview(s) did not close in time; skipping CEF shutdown.\n", wvcef_n_live_browsers());
-        } else {
-            wvcef_shutdown();
         }
     }
 
-    // on_browser_closed already freed everything that actually closed.
+    // Everything is torn down here rather than in on_browser_closed_on_platform,
+    // because that runs as a platform task and the event loop has already stopped
+    // by the time plugins are deinitialized -- the tasks CEF's thread just posted
+    // will never be dispatched. Which also means nothing else is going to touch
+    // these webviews, so freeing them here is safe; the undispatched tasks hold
+    // pointers into them, but the process is on its way out.
+    //
+    // Before wvcef_shutdown(), so no handle outlives the CEF runtime.
     while (plugin.webviews != NULL) {
         struct webview *wv = plugin.webviews;
 
         plugin.webviews = wv->next;
+
+        if (wv->browser != NULL) {
+            wvcef_browser_destroy(wv->browser);
+        }
+
         free(wv->swizzle_buffer);
         free(wv);
+    }
+
+    if (wvcef_is_initialized() && wvcef_n_live_browsers() == 0) {
+        wvcef_shutdown();
     }
 
     if (plugin.egl_context != EGL_NO_CONTEXT) {

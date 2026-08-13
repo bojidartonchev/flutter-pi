@@ -21,6 +21,12 @@
  *   - callbacks in @ref wvcef_host_callbacks are invoked on CEF's UI thread, so
  *     implementations must not touch flutter-pi state that isn't thread safe.
  *
+ * A single @ref wvcef_browser handle is *not* internally serialised, though: the
+ * caller must not use one from two threads at once, and must not use it at all
+ * after passing it to @ref wvcef_browser_destroy. What a handle does tolerate is
+ * CEF closing the browser underneath it -- every call then becomes a no-op, so
+ * there is no window in which the caller has to have noticed yet.
+ *
  * The other way round is tempting: CEF's `external_message_pump` makes the host's
  * thread the UI thread, and then every callback can touch flutter-pi directly with
  * no locks at all. It works until a Chromium task on the UI thread blocks waiting
@@ -82,9 +88,10 @@ struct wvcef_host_callbacks {
     /// @param cursor_type a cef_cursor_type_t value.
     void (*on_cursor_changed)(void *userdata, int cursor_type);
 
-    /// Called once the underlying browser is gone. After this returns, the
-    /// struct wvcef_browser handle must not be used anymore -- the bridge frees
-    /// it.
+    /// Called once the underlying browser is gone. The handle stays valid --
+    /// calls on it just stop doing anything -- until @ref wvcef_browser_destroy.
+    /// Note this arrives on CEF's UI thread, so a host that owns its handle from
+    /// somewhere else should hand the destroying over to that thread.
     void (*on_closed)(void *userdata);
 };
 
@@ -174,9 +181,13 @@ struct wvcef_browser *wvcef_browser_create(
 /// package uses to address a webview. 0 if the browser is already gone.
 int wvcef_browser_get_id(struct wvcef_browser *browser);
 
-/// Asks the browser to close. @ref wvcef_host_callbacks::on_closed is called
-/// once it's really gone; only then is the handle released.
+/// Asks the browser to close. @ref wvcef_host_callbacks::on_closed is called once
+/// it's really gone.
 void wvcef_browser_close(struct wvcef_browser *browser);
+
+/// Releases the handle. Call it after @ref wvcef_host_callbacks::on_closed, from
+/// whichever thread owns the handle. The handle must not be used afterwards.
+void wvcef_browser_destroy(struct wvcef_browser *browser);
 
 void wvcef_browser_load_url(struct wvcef_browser *browser, const char *url);
 void wvcef_browser_reload(struct wvcef_browser *browser, bool ignore_cache);

@@ -126,7 +126,10 @@ public:
     CefRefPtr<CefDisplayHandler> GetDisplayHandler() override { return this; }
 
     // -- CefLifeSpanHandler -------------------------------------------------
-    void OnAfterCreated(CefRefPtr<CefBrowser> browser) override { browser_ = browser; }
+    void OnAfterCreated(CefRefPtr<CefBrowser> browser) override {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        browser_ = browser;
+    }
 
     bool DoClose(CefRefPtr<CefBrowser> browser) override {
         (void) browser;
@@ -136,7 +139,15 @@ public:
 
     void OnBeforeClose(CefRefPtr<CefBrowser> browser) override {
         (void) browser;
-        browser_ = nullptr;
+
+        // Kept alive until `dying` goes out of scope at the end of this function,
+        // so the last reference isn't dropped with the lock held.
+        CefRefPtr<CefBrowser> dying;
+        {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            dying = browser_;
+            browser_ = nullptr;
+        }
 
         // This is the last callback for this browser, and the host frees the
         // object `userdata_` points at while handling it. Drop both before
@@ -185,6 +196,8 @@ public:
     // -- CefRenderHandler ---------------------------------------------------
     void GetViewRect(CefRefPtr<CefBrowser> browser, CefRect &rect) override {
         (void) browser;
+
+        std::lock_guard<std::mutex> lock(state_mutex_);
         rect.x = 0;
         rect.y = 0;
         rect.width = logical_width_ > 0 ? logical_width_ : 1;
@@ -193,6 +206,8 @@ public:
 
     bool GetScreenInfo(CefRefPtr<CefBrowser> browser, CefScreenInfo &screen_info) override {
         (void) browser;
+
+        std::lock_guard<std::mutex> lock(state_mutex_);
 
         screen_info.device_scale_factor = static_cast<float>(scale_);
         screen_info.depth = 32;
@@ -392,14 +407,23 @@ public:
     }
 
     // -- Used by the C API --------------------------------------------------
-    CefRefPtr<CefBrowser> browser() const { return browser_; }
 
+    /// A strong reference, so the caller can keep using the browser even if CEF
+    /// closes it in the meantime. Null once it's gone.
+    CefRefPtr<CefBrowser> browser() const {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        return browser_;
+    }
+
+    /// Only called while the browser is being set up or torn down, never
+    /// concurrently with OnBeforeClose, so it needs no lock.
     void set_on_gone(gone_cb_t cb, void *userdata) {
         on_gone_ = cb;
         on_gone_userdata_ = userdata;
     }
 
     void set_size(int logical_width, int logical_height, double scale) {
+        std::lock_guard<std::mutex> lock(state_mutex_);
         logical_width_ = logical_width;
         logical_height_ = logical_height;
         scale_ = scale;
@@ -427,9 +451,17 @@ private:
         composite_buffer_ = view_buffer_;
 
         if (!popup_buffer_.empty() && popup_width_ > 0 && popup_height_ > 0) {
+            // Read once, and not while the host callback below is running -- the
+            // host takes locks of its own in on_paint.
+            double scale;
+            {
+                std::lock_guard<std::mutex> lock(state_mutex_);
+                scale = scale_;
+            }
+
             // popup_rect_ is logical, the buffers are physical pixels.
-            const int off_x = static_cast<int>(popup_rect_.x * scale_);
-            const int off_y = static_cast<int>(popup_rect_.y * scale_);
+            const int off_x = static_cast<int>(popup_rect_.x * scale);
+            const int off_y = static_cast<int>(popup_rect_.y * scale);
 
             for (int row = 0; row < popup_height_; row++) {
                 const int dst_y = off_y + row;
@@ -463,6 +495,14 @@ private:
 
         callbacks_.on_paint(userdata_, composite_buffer_.data(), view_width_, view_height_);
     }
+
+    /// Guards `browser_` and the geometry below -- the only members touched from
+    /// more than one thread. CEF sets and clears browser_ on its UI thread and
+    /// reads the geometry there (GetViewRect, GetScreenInfo), while the host reads
+    /// browser_ and writes the geometry (set_size) from its own thread.
+    ///
+    /// Never held while calling a host callback: those take locks of their own.
+    mutable std::mutex state_mutex_;
 
     CefRefPtr<CefBrowser> browser_;
 
@@ -516,8 +556,14 @@ cef_log_severity_t to_log_severity(int severity) {
 // C API
 // ---------------------------------------------------------------------------
 
-/// Handle handed out to the C side. Owned by the bridge, freed once the
-/// underlying browser has really gone away (after on_closed).
+/// Handle handed out to the C side. Owned by the *caller*, which releases it with
+/// wvcef_browser_destroy() once on_closed has told it the browser is gone.
+///
+/// Not thread safe in itself -- the owner serialises its own calls, which plugin.c
+/// does by only ever touching a handle from flutter-pi's platform thread. What it
+/// does survive is CEF closing the browser underneath it on another thread: the
+/// client outlives that, its browser() goes null, and every call below turns into a
+/// no-op until the owner gets around to destroying the handle.
 struct wvcef_browser {
     CefRefPtr<WebviewClient> client;
     bool close_requested;
@@ -526,25 +572,19 @@ struct wvcef_browser {
 namespace {
 
 /// Called on CEF's UI thread, from inside the client's own OnBeforeClose.
+///
+/// Deliberately does *not* free the handle. The owner is still holding that
+/// pointer on another thread and has no way to know it just became invalid;
+/// freeing it here is a use-after-free waiting for the next event the browser
+/// happens to get. It goes away in wvcef_browser_destroy() instead.
 void on_client_gone(void *userdata) {
-    struct wvcef_browser *handle = static_cast<struct wvcef_browser *>(userdata);
+    (void) userdata;
 
+    // Only ever decremented here, and OnBeforeClose is always on the UI thread,
+    // so the read and the decrement can't interleave with another decrement.
     if (g_n_live_browsers.load() > 0) {
         g_n_live_browsers--;
     }
-
-    if (handle == nullptr) {
-        return;
-    }
-
-    // Not freed here: dropping the handle's CefRefPtr may destroy the very client
-    // object whose callback is on the stack. A UI thread task runs after this
-    // returns, and after anything already queued that might still name the
-    // handle, so it is the natural place to let go.
-    post_to_ui([handle]() {
-        handle->client = nullptr;
-        delete handle;
-    });
 }
 
 CefRefPtr<CefBrowser> browser_of(struct wvcef_browser *browser) {
@@ -716,6 +756,12 @@ struct wvcef_browser *wvcef_browser_create(
     };
     auto state = std::make_shared<create_state>();
 
+    // Counted before the browser exists, not after: OnBeforeClose decrements, and
+    // a browser that closes the instant it opens would otherwise decrement a zero
+    // that this thread then raises to one -- leaving a phantom browser that
+    // wvcef_shutdown() waits for forever.
+    g_n_live_browsers++;
+
     post_to_ui([state, handle, target, frame_rate]() {
         CefWindowInfo window_info;
         window_info.SetAsWindowless(0);
@@ -739,12 +785,17 @@ struct wvcef_browser *wvcef_browser_create(
         if (!state->cv.wait_for(guard, std::chrono::seconds(15), [&state]() { return state->done; })) {
             LOG_CEF("Timed out waiting for CEF's UI thread to create a browser.\n");
             // The task may still run and use `handle`, so it can't be freed here.
-            // One leaked handle is the lesser evil.
+            // One leaked handle is the lesser evil. The live count stays raised for
+            // the same reason -- the browser may yet appear -- which costs shutdown
+            // the couple of seconds it is prepared to wait.
             return nullptr;
         }
 
         if (!state->created) {
             LOG_CEF("CefBrowserHost::CreateBrowserSync failed.\n");
+            // The task has run and no browser came of it, so OnBeforeClose will
+            // never fire for this one: undo the count here instead.
+            g_n_live_browsers--;
             handle->client->set_on_gone(nullptr, nullptr);
             handle->client = nullptr;
             delete handle;
@@ -752,8 +803,19 @@ struct wvcef_browser *wvcef_browser_create(
         }
     }
 
-    g_n_live_browsers++;
     return handle;
+}
+
+void wvcef_browser_destroy(struct wvcef_browser *browser) {
+    if (browser == nullptr) {
+        return;
+    }
+
+    // CEF keeps its own reference to the client until the browser is completely
+    // torn down, so this may not be the last one -- which is fine. The client stops
+    // calling out in OnBeforeClose, well before this runs.
+    browser->client = nullptr;
+    delete browser;
 }
 
 int wvcef_browser_get_id(struct wvcef_browser *browser) {
