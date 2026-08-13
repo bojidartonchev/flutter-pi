@@ -67,6 +67,11 @@
 #define MIN_FRAME_RATE 1
 #define MAX_FRAME_RATE 60
 
+/// How many times one event loop turn may run CEF's message loop before handing
+/// control back, so a busy page can't starve flutter-pi's own loop -- input,
+/// vsync and the engine's tasks all come through it.
+#define MAX_PUMPS_PER_TURN 32
+
 /// Traces the browser and frame lifecycle when FLUTTERPI_CEF_TRACE is set.
 ///
 /// Deliberately not LOG_DEBUG: that is compiled out unless flutter-pi itself was
@@ -147,9 +152,12 @@ struct webview_cef_plugin {
     pthread_t cef_ui_thread;
     bool cef_ui_thread_valid;
 
-    /// Set while CefDoMessageLoopWork() is on the stack, so a pump requested from
-    /// inside the pump doesn't recurse into it.
+    /// Set while CefDoMessageLoopWork() is on the stack. Platform thread only.
     bool in_pump;
+
+    /// CEF asked for immediate work from inside the pump, so the drain loop should
+    /// go round again. Platform thread only.
+    bool want_immediate;
 
     /// Guards the pump bookkeeping, which CEF may touch from other threads.
     pthread_mutex_t pump_mutex;
@@ -339,43 +347,53 @@ static void webview_release_textures(struct webview *wv) {
 
 static void on_schedule_pump_work(void *userdata, int64_t delay_ms);
 
-/// Runs one iteration of CEF's message loop, guards against reentering it, and
-/// leaves a next pump scheduled behind it.
+/// CEF's message loop is only ever run from here, off flutter-pi's event loop,
+/// and never from inside one of our own calls into CEF or from a platform channel
+/// handler. Running it from an arbitrary point in the middle of somebody else's
+/// call is asking for trouble that is very hard to attribute afterwards.
 ///
-/// Every pump has to end with something scheduled, whichever path it came in on.
-/// A synchronous pump never touches the queue, so if CEF happens to want nothing
-/// at that moment, and nothing else calls into CEF afterwards, that is the end of
-/// the message loop -- and the page stops painting while still looking alive,
-/// because its own process keeps running.
-static void pump_now(void) {
+/// The queue is drained rather than advanced one step per turn: CEF asks for
+/// immediate work repeatedly while it has a backlog, and answering each request
+/// with a separate event loop turn caps the UI thread's throughput at the loop's
+/// rate. That is invisible on a static page and crippling on one that makes
+/// hundreds of requests, since every hop through the browser process waits for
+/// the next turn -- slow enough that page-side timeouts start firing, which reads
+/// as a network problem and is not one.
+static int on_pump_message_loop(void *userdata) {
     bool rearm;
 
-    plugin.in_pump = true;
-    wvcef_do_message_loop_work();
-    plugin.in_pump = false;
+    (void) userdata;
+
+    for (int i = 0; i < MAX_PUMPS_PER_TURN; i++) {
+        // Cleared before the pump, not after: CEF calls OnScheduleMessagePumpWork
+        // from inside CefDoMessageLoopWork, and a request for a *later* pump has
+        // to be able to queue itself rather than being coalesced into this one.
+        pthread_mutex_lock(&plugin.pump_mutex);
+        plugin.pump_scheduled = false;
+        pthread_mutex_unlock(&plugin.pump_mutex);
+
+        plugin.want_immediate = false;
+        plugin.in_pump = true;
+        wvcef_do_message_loop_work();
+        plugin.in_pump = false;
+
+        if (!plugin.want_immediate) {
+            break;
+        }
+    }
 
     pthread_mutex_lock(&plugin.pump_mutex);
     rearm = !plugin.pump_scheduled;
     pthread_mutex_unlock(&plugin.pump_mutex);
 
-    // Only while a browser could still paint; an app that closed its webviews
-    // shouldn't keep a timer alive. See pump_max_delay_ms.
+    // Every turn ends with something scheduled, or the loop has nowhere to
+    // continue from and the page quietly stops painting while still looking
+    // alive. Only while a browser could still paint, though -- an app that closed
+    // its webviews shouldn't keep a timer running. See pump_max_delay_ms.
     if (rearm && wvcef_n_live_browsers() > 0) {
         on_schedule_pump_work(NULL, plugin.pump_max_delay_ms);
     }
-}
 
-static int on_pump_message_loop(void *userdata) {
-    (void) userdata;
-
-    // Cleared before the pump, not after: CEF calls OnScheduleMessagePumpWork
-    // from inside CefDoMessageLoopWork, and that request has to be able to queue
-    // the next pump rather than being coalesced away into this one.
-    pthread_mutex_lock(&plugin.pump_mutex);
-    plugin.pump_scheduled = false;
-    pthread_mutex_unlock(&plugin.pump_mutex);
-
-    pump_now();
     return 0;
 }
 
@@ -392,22 +410,16 @@ static void on_schedule_pump_work(void *userdata, int64_t delay_ms) {
         delay_ms = plugin.pump_max_delay_ms;
     }
 
-    // "Do this now" is answered now, not on the next turn of the event loop.
+    // "More work, now" raised from inside the pump is answered by the drain loop
+    // in on_pump_message_loop rather than by queueing a task, so a backlog costs
+    // one event loop turn instead of one turn per item.
     //
-    // Going through the event loop for immediate work puts a hard ceiling on how
-    // fast CEF's UI thread can drain its queue: one iteration per posted task, so
-    // at the heartbeat's granularity. That is invisible on a static page and
-    // brutal on one that makes hundreds of requests, because every hop through
-    // the browser process waits for the next tick -- a page can take so long that
-    // its own loader gives up. Bandwidth is not the problem in that situation and
-    // measuring it will say so.
-    //
-    // Safe because this is CEF's UI thread, which is the thread the event loop
-    // would have run the task on anyway. Requests raised from inside the pump
-    // still go through the queue, matching what CEF's reference pump does with a
-    // reentrant DoWork.
-    if (delay_ms == 0 && !plugin.in_pump && plugin.cef_ui_thread_valid && pthread_equal(pthread_self(), plugin.cef_ui_thread)) {
-        pump_now();
+    // The thread check is not redundant with in_pump: this is called from other
+    // threads too, and in_pump and want_immediate belong to the pumping thread. A
+    // request from elsewhere that took this path would both race on them and be
+    // lost, since the drain loop may already have read the flag.
+    if (delay_ms == 0 && plugin.in_pump && plugin.cef_ui_thread_valid && pthread_equal(pthread_self(), plugin.cef_ui_thread)) {
+        plugin.want_immediate = true;
         return;
     }
 
