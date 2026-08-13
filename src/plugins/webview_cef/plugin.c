@@ -133,6 +133,15 @@ struct webview_cef_plugin {
     /// FLUTTERPI_CEF_TRACE is set; see TRACE above.
     bool trace;
 
+    /// The thread CEF was initialized on, which is therefore its UI thread. Only
+    /// meaningful once CEF is up.
+    pthread_t cef_ui_thread;
+    bool cef_ui_thread_valid;
+
+    /// Set while CefDoMessageLoopWork() is on the stack, so a pump requested from
+    /// inside the pump doesn't recurse into it.
+    bool in_pump;
+
     /// Guards the pump bookkeeping, which CEF may touch from other threads.
     pthread_mutex_t pump_mutex;
     bool pump_scheduled;
@@ -321,6 +330,13 @@ static void webview_release_textures(struct webview *wv) {
 
 static void on_schedule_pump_work(void *userdata, int64_t delay_ms);
 
+/// Runs one iteration of CEF's message loop, guarding against reentering it.
+static void pump_now(void) {
+    plugin.in_pump = true;
+    wvcef_do_message_loop_work();
+    plugin.in_pump = false;
+}
+
 static int on_pump_message_loop(void *userdata) {
     bool rearm;
 
@@ -333,7 +349,7 @@ static int on_pump_message_loop(void *userdata) {
     plugin.pump_scheduled = false;
     pthread_mutex_unlock(&plugin.pump_mutex);
 
-    wvcef_do_message_loop_work();
+    pump_now();
 
     pthread_mutex_lock(&plugin.pump_mutex);
     rearm = !plugin.pump_scheduled;
@@ -359,6 +375,25 @@ static void on_schedule_pump_work(void *userdata, int64_t delay_ms) {
         delay_ms = 0;
     } else if (delay_ms > plugin.pump_max_delay_ms) {
         delay_ms = plugin.pump_max_delay_ms;
+    }
+
+    // "Do this now" is answered now, not on the next turn of the event loop.
+    //
+    // Going through the event loop for immediate work puts a hard ceiling on how
+    // fast CEF's UI thread can drain its queue: one iteration per posted task, so
+    // at the heartbeat's granularity. That is invisible on a static page and
+    // brutal on one that makes hundreds of requests, because every hop through
+    // the browser process waits for the next tick -- a page can take so long that
+    // its own loader gives up. Bandwidth is not the problem in that situation and
+    // measuring it will say so.
+    //
+    // Safe because this is CEF's UI thread, which is the thread the event loop
+    // would have run the task on anyway. Requests raised from inside the pump
+    // still go through the queue, matching what CEF's reference pump does with a
+    // reentrant DoWork.
+    if (delay_ms == 0 && !plugin.in_pump && plugin.cef_ui_thread_valid && pthread_equal(pthread_self(), plugin.cef_ui_thread)) {
+        pump_now();
+        return;
     }
 
     deadline_us = now_monotonic_us() + (uint64_t) delay_ms * 1000ull;
@@ -781,6 +816,11 @@ static int ensure_cef_initialized(const char *user_agent) {
     if (ok != 0) {
         return ok;
     }
+
+    // CEF was initialized on this thread, so this is its UI thread for the rest
+    // of the process's life. on_schedule_pump_work needs to know.
+    plugin.cef_ui_thread = pthread_self();
+    plugin.cef_ui_thread_valid = true;
 
     pump_soon();
     return 0;

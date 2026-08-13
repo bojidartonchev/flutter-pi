@@ -819,6 +819,15 @@ void wvcef_browser_send_mouse_click(struct wvcef_browser *browser, int x, int y,
     event.y = y;
     event.modifiers = EVENTFLAG_LEFT_MOUSE_BUTTON;
 
+    if (!is_up) {
+        // Move there before pressing. A mouse always arrives via hover events, so
+        // the page already knows where the cursor is -- but a touchscreen has no
+        // hover, so the press would otherwise be the first the page hears of that
+        // position, and anything that resolves its target from the last move sees
+        // the press somewhere else entirely.
+        b->GetHost()->SendMouseMoveEvent(event, false);
+    }
+
     b->GetHost()->SendMouseClickEvent(event, MBT_LEFT, is_up, 1);
 }
 
