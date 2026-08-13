@@ -56,6 +56,20 @@ clamps requested delays to the same interval. CEF's reference implementation
 (`MainMessageLoopExternalPump` in cefclient) clamps its timer for the same
 reason.
 
+A request for *immediate* work is answered immediately, on the spot, rather than
+by queueing a task -- again following cefclient. Routing immediate work through
+the event loop caps how fast CEF's UI thread can drain its queue at one iteration
+per loop turn, which is invisible on a static page and crippling on one that
+makes hundreds of requests: everything still works, just slowly enough that
+page-side timeouts start firing.
+
+Both paths end by making sure something will pump again. That is not a detail: a
+synchronous pump never touches the queue, so if CEF wants nothing at that instant
+the loop has nowhere to continue from, and the pump is simply over. The symptom
+is a webview that sometimes never loads at all and sometimes stops partway,
+depending on what CEF happened to have queued -- and the page looks alive
+throughout, because its own process is still running fine.
+
 ### Processes
 
 Chromium is multi-process, and on Linux it starts subprocesses by re-executing a
@@ -221,7 +235,11 @@ handling, and it's the main thing left to do here.
 - **Dirty rects are ignored**; every paint uploads the whole surface. GLES2 has
   no `GL_UNPACK_ROW_LENGTH`, so partial uploads would need a per-row loop.
 - **`--disable-gpu`**, so page compositing happens on the CPU. Fine for forms and
-  text, not for WebGL or heavy CSS animation.
+  text, slow for heavy CSS animation. WebGL does work, through SwiftShader, but
+  it is software rasterisation and it costs accordingly -- and it only works
+  because of the `--enable-unsafe-swiftshader` default switch, since Chromium
+  stopped falling back to software WebGL by itself around M120. Without that
+  switch a WebGL page loads completely and then draws nothing at all.
 - **Popups** (`<select>` dropdowns) are composited into the view buffer while
   they are open, which costs one extra full-frame copy per paint. Nothing is
   copied when no popup is open.

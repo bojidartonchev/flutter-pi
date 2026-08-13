@@ -435,7 +435,7 @@ It's off by default, because it needs a CEF binary distribution:
 2. Build `libcef_dll_wrapper` from the sources in that distribution — CEF is meant to be wrapped with your own compiler.
 3. Configure flutter-pi with `-DBUILD_WEBVIEW_CEF_PLUGIN=ON -DCEF_ROOT=<path to the distribution>`.
 
-Pages are rendered off-screen and shown as flutter external textures, since flutter-pi has no platform views. Chromium runs with `--ozone-platform=headless --disable-gpu`, so page compositing happens on the CPU — fine for forms and text, not for WebGL.
+Pages are rendered off-screen and shown as flutter external textures, since flutter-pi has no platform views. Chromium runs with `--ozone-platform=headless --disable-gpu`, so page compositing happens on the CPU. WebGL works, through SwiftShader — it renders correctly but costs a lot of CPU, so treat it as usable rather than fast.
 
 See [src/plugins/webview_cef/README.md](src/plugins/webview_cef/README.md) for the runtime configuration, the implemented channel methods and the known limitations.
 

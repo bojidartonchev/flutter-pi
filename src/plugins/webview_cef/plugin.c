@@ -87,6 +87,15 @@ static const char *const default_switches[] = {
     "ozone-platform=headless",
     "disable-gpu",
     "disable-gpu-compositing",
+    // Chromium stopped falling back to software WebGL on its own around M120: it
+    // now refuses to create the context and says, in the log, to pass this flag.
+    // Since --disable-gpu above leaves software as the only option, WebGL content
+    // gets no context at all without it -- and a page that renders through WebGL
+    // then loads completely and draws nothing, which is a confusing way to fail.
+    // The "unsafe" is about running untrusted shaders through a software
+    // rasteriser; a kiosk pointed at a known page is exactly the trusted case the
+    // flag exists for.
+    "enable-unsafe-swiftshader",
     "disable-dev-shm-usage",
     "autoplay-policy=no-user-gesture-required",
 };
@@ -330,16 +339,33 @@ static void webview_release_textures(struct webview *wv) {
 
 static void on_schedule_pump_work(void *userdata, int64_t delay_ms);
 
-/// Runs one iteration of CEF's message loop, guarding against reentering it.
+/// Runs one iteration of CEF's message loop, guards against reentering it, and
+/// leaves a next pump scheduled behind it.
+///
+/// Every pump has to end with something scheduled, whichever path it came in on.
+/// A synchronous pump never touches the queue, so if CEF happens to want nothing
+/// at that moment, and nothing else calls into CEF afterwards, that is the end of
+/// the message loop -- and the page stops painting while still looking alive,
+/// because its own process keeps running.
 static void pump_now(void) {
+    bool rearm;
+
     plugin.in_pump = true;
     wvcef_do_message_loop_work();
     plugin.in_pump = false;
+
+    pthread_mutex_lock(&plugin.pump_mutex);
+    rearm = !plugin.pump_scheduled;
+    pthread_mutex_unlock(&plugin.pump_mutex);
+
+    // Only while a browser could still paint; an app that closed its webviews
+    // shouldn't keep a timer alive. See pump_max_delay_ms.
+    if (rearm && wvcef_n_live_browsers() > 0) {
+        on_schedule_pump_work(NULL, plugin.pump_max_delay_ms);
+    }
 }
 
 static int on_pump_message_loop(void *userdata) {
-    bool rearm;
-
     (void) userdata;
 
     // Cleared before the pump, not after: CEF calls OnScheduleMessagePumpWork
@@ -350,17 +376,6 @@ static int on_pump_message_loop(void *userdata) {
     pthread_mutex_unlock(&plugin.pump_mutex);
 
     pump_now();
-
-    pthread_mutex_lock(&plugin.pump_mutex);
-    rearm = !plugin.pump_scheduled;
-    pthread_mutex_unlock(&plugin.pump_mutex);
-
-    // Nothing asked for the next pump, so keep the heartbeat going ourselves for
-    // as long as there is a browser that could still paint. See pump_max_delay_ms.
-    if (rearm && wvcef_n_live_browsers() > 0) {
-        on_schedule_pump_work(NULL, plugin.pump_max_delay_ms);
-    }
-
     return 0;
 }
 
