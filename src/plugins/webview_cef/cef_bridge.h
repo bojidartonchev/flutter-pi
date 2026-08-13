@@ -11,17 +11,24 @@
  *
  * Threading contract
  * ------------------
- * CEF is initialized with an *external message pump*, which means the CEF
- * "UI thread" is whichever thread called @ref wvcef_initialize -- for us that's
- * flutter-pi's platform thread. As a consequence:
+ * CEF runs its browser process message loop on a thread of its own
+ * (`multi_threaded_message_loop`), so CEF's "UI thread" is *not* flutter-pi's
+ * platform thread:
  *
- *   - every wvcef_* function except @ref wvcef_schedule_pump_cb must be called
- *     on the platform thread, and
- *   - every callback in @ref wvcef_host_callbacks is invoked on the platform
- *     thread, so implementations may touch flutter-pi state directly.
+ *   - wvcef_* functions may be called from any thread. CEF documents its browser
+ *     and browser-host methods as callable from any browser process thread, and
+ *     the one exception (creating a browser) is marshalled inside the bridge.
+ *   - callbacks in @ref wvcef_host_callbacks are invoked on CEF's UI thread, so
+ *     implementations must not touch flutter-pi state that isn't thread safe.
  *
- * The single exception is the pump-scheduling callback, which CEF may invoke
- * from any thread.
+ * The other way round is tempting: CEF's `external_message_pump` makes the host's
+ * thread the UI thread, and then every callback can touch flutter-pi directly with
+ * no locks at all. It works until a Chromium task on the UI thread blocks waiting
+ * for more UI thread work -- a real message loop nests and delivers it, an external
+ * pump cannot, because the host is stuck inside its one CefDoMessageLoopWork() call
+ * and cannot re-enter it. The process then stops for good with the page still
+ * looking alive. A WebGL page reached that within seconds here, and CEF's own
+ * documentation recommends against the option. So: a real loop, and locks.
  *
  * Coordinate systems
  * ------------------
@@ -50,8 +57,8 @@ struct wvcef_browser;
 /**
  * @brief Callbacks a webview instance delivers to the host (plugin.c).
  *
- * All of these are invoked on the platform thread. Strings are only valid for
- * the duration of the call. Every one of them may be NULL.
+ * All of these are invoked on CEF's UI thread. Strings are only valid for the
+ * duration of the call. Every one of them may be NULL.
  */
 struct wvcef_host_callbacks {
     /**
@@ -80,14 +87,6 @@ struct wvcef_host_callbacks {
     /// it.
     void (*on_closed)(void *userdata);
 };
-
-/**
- * @brief Called by CEF when @ref wvcef_do_message_loop_work should be called
- * again, in @ref delay_ms milliseconds.
- *
- * MAY BE CALLED FROM ANY THREAD.
- */
-typedef void (*wvcef_schedule_pump_cb)(void *userdata, int64_t delay_ms);
 
 struct wvcef_init_options {
     /// Absolute path of the CEF subprocess helper executable
@@ -121,9 +120,6 @@ struct wvcef_init_options {
     /// switch.
     const char *const *switches;
     size_t n_switches;
-
-    wvcef_schedule_pump_cb schedule_pump;
-    void *schedule_pump_userdata;
 };
 
 /**
@@ -135,8 +131,10 @@ struct wvcef_init_options {
 int wvcef_execute_subprocess(int argc, char **argv);
 
 /**
- * @brief Initialize CEF. Must be called on the platform thread. Calling it more
- * than once is a no-op.
+ * @brief Initialize CEF and start the thread its message loop runs on.
+ *
+ * Call on the process's main thread: CEF installs signal handlers and forks its
+ * helper processes from here. Calling it more than once is a no-op.
  *
  * @returns 0 on success, an errno-style code otherwise.
  */
@@ -145,15 +143,12 @@ int wvcef_initialize(const struct wvcef_init_options *options);
 /// True if @ref wvcef_initialize succeeded and @ref wvcef_shutdown hasn't run yet.
 bool wvcef_is_initialized(void);
 
-/// Let CEF do some work. Call from the platform thread, whenever the
-/// @ref wvcef_schedule_pump_cb deadline expires.
-void wvcef_do_message_loop_work(void);
-
 /// Number of browsers that were created and haven't fully closed yet.
 int wvcef_n_live_browsers(void);
 
-/// Tears CEF down. All browsers must have been closed before. CEF cannot be
-/// initialized again afterwards, in this process.
+/// Tears CEF down and joins its message loop thread. All browsers must have been
+/// closed before. Call on the main thread. CEF cannot be initialized again
+/// afterwards, in this process.
 void wvcef_shutdown(void);
 
 /**

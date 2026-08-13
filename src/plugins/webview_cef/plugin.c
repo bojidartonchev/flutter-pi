@@ -3,16 +3,20 @@
  * CEF powered webview plugin
  *
  * The flutter-pi side of the webview: speaks the `webview_cef` pub package's
- * platform channel, drives CEF's message pump from flutter-pi's event loop, and
- * turns the BGRA frames CEF renders off-screen into flutter external textures.
+ * platform channel and turns the BGRA frames CEF renders off-screen into flutter
+ * external textures.
  *
- * Everything in here runs on the platform thread:
- *   - platform channel handlers are dispatched there by the plugin registry,
- *   - CEF is initialized there, which makes it CEF's "UI thread", so all
- *     cef_bridge callbacks (including on_paint) arrive there too.
+ * Two threads meet in here:
+ *   - platform channel handlers run on flutter-pi's platform thread,
+ *   - every cef_bridge callback runs on CEF's own UI thread (see cef_bridge.h for
+ *     why CEF owns that thread rather than borrowing ours).
  *
- * The only exception is on_schedule_pump_work, which CEF may call from any
- * thread; it just posts a task back to the platform thread.
+ * So the webview list is only ever touched from the platform thread -- anything
+ * arriving from CEF that has to change it is posted there -- and everything a
+ * frame touches on its way to a texture is behind @ref webview_cef_plugin::gl_mutex.
+ * Sending a platform message is the one thing safe to do from either thread:
+ * flutterpi_send_platform_message posts to the platform thread when it isn't
+ * already on it.
  *
  * Copyright (c) 2026, Bojidar Tonchev <bojidar.tonchev@gmail.com>
  */
@@ -62,15 +66,9 @@
 #define MAX_SWITCHES 64
 #define DEFAULT_FRAME_RATE 30
 
-/// Bounds for the pump heartbeat, in frames per second. CEF clamps
-/// `windowless_frame_rate` to the same range.
+/// CEF clamps `windowless_frame_rate` to this range.
 #define MIN_FRAME_RATE 1
 #define MAX_FRAME_RATE 60
-
-/// How many times one event loop turn may run CEF's message loop before handing
-/// control back, so a busy page can't starve flutter-pi's own loop -- input,
-/// vsync and the engine's tasks all come through it.
-#define MAX_PUMPS_PER_TURN 32
 
 /// Traces the browser and frame lifecycle when FLUTTERPI_CEF_TRACE is set.
 ///
@@ -161,35 +159,13 @@ struct webview_cef_plugin {
     /// FLUTTERPI_CEF_TRACE; see TRACE and TRACE2 above.
     int trace_level;
 
-    /// The thread CEF was initialized on, which is therefore its UI thread. Only
-    /// meaningful once CEF is up.
-    pthread_t cef_ui_thread;
-    bool cef_ui_thread_valid;
-
-    /// Set while CefDoMessageLoopWork() is on the stack. Platform thread only.
-    bool in_pump;
-
-    /// CEF asked for immediate work from inside the pump, so the drain loop should
-    /// go round again. Platform thread only.
-    bool want_immediate;
-
-    /// Guards the pump bookkeeping, which CEF may touch from other threads.
-    pthread_mutex_t pump_mutex;
-    bool pump_scheduled;
-    uint64_t pump_deadline_us;
-
-    /// The longest we let the CEF message pump idle while a browser is alive,
-    /// derived from the configured frame rate.
+    /// Guards the EGL context and every webview's texture state.
     ///
-    /// `OnScheduleMessagePumpWork` is a request, not a promise that CEF will ask
-    /// again: once a pump runs and CEF asks for nothing further, a pump that only
-    /// ever runs when asked has no way back and CEF's UI thread stops for good.
-    /// Everything off that thread -- networking, the render processes -- keeps
-    /// going, so a page still loads and runs; it just never paints again after
-    /// the frame that was already in flight, until something like a mouse event
-    /// happens to kick the pump. CEF's own reference pump (cefclient's
-    /// MainMessageLoopExternalPump) clamps its timer for the same reason.
-    int64_t pump_max_delay_ms;
+    /// Frames arrive on CEF's UI thread while the platform thread may be
+    /// tearing the same webview down, and the plugin's EGL context is made
+    /// current and released within each use, so it is shareable between threads
+    /// -- but only one at a time.
+    pthread_mutex_t gl_mutex;
 
     struct webview *webviews;
 };
@@ -202,13 +178,6 @@ static struct webview_cef_plugin plugin;
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
-
-static uint64_t now_monotonic_us(void) {
-    struct timespec ts;
-
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t) ts.tv_sec * 1000000ull + (uint64_t) ts.tv_nsec / 1000ull;
-}
 
 static const char *resolve_env(const char *env_name, const char *fallback) {
     const char *env = getenv(env_name);
@@ -239,8 +208,7 @@ static long resolve_env_long(const char *env_name, long fallback) {
     return value;
 }
 
-/// `windowless_frame_rate` for new browsers, and the rate the pump heartbeat has
-/// to keep up with so it never becomes the thing limiting the frame rate.
+/// `windowless_frame_rate` for new browsers.
 static long resolve_frame_rate(void) {
     long frame_rate = resolve_env_long("FLUTTERPI_CEF_FRAME_RATE", DEFAULT_FRAME_RATE);
 
@@ -338,7 +306,13 @@ static void webview_free(struct webview *wv) {
 }
 
 /// Releases the flutter texture and the GL texture. Safe to call twice.
+///
+/// Platform thread. Takes gl_mutex because a frame may be arriving on CEF's UI
+/// thread at the same moment, and it must not find a half-released webview or the
+/// EGL context current on another thread.
 static void webview_release_textures(struct webview *wv) {
+    pthread_mutex_lock(&plugin.gl_mutex);
+
     if (wv->texture != NULL) {
         texture_destroy(wv->texture);
         wv->texture = NULL;
@@ -353,116 +327,8 @@ static void webview_release_textures(struct webview *wv) {
         }
         wv->gl_texture = 0;
     }
-}
 
-// ---------------------------------------------------------------------------
-// CEF message pump, driven from flutter-pi's event loop
-// ---------------------------------------------------------------------------
-
-static void on_schedule_pump_work(void *userdata, int64_t delay_ms);
-
-/// CEF's message loop is only ever run from here, off flutter-pi's event loop,
-/// and never from inside one of our own calls into CEF or from a platform channel
-/// handler. Running it from an arbitrary point in the middle of somebody else's
-/// call is asking for trouble that is very hard to attribute afterwards.
-///
-/// The queue is drained rather than advanced one step per turn: CEF asks for
-/// immediate work repeatedly while it has a backlog, and answering each request
-/// with a separate event loop turn caps the UI thread's throughput at the loop's
-/// rate. That is invisible on a static page and crippling on one that makes
-/// hundreds of requests, since every hop through the browser process waits for
-/// the next turn -- slow enough that page-side timeouts start firing, which reads
-/// as a network problem and is not one.
-static int on_pump_message_loop(void *userdata) {
-    bool rearm;
-
-    (void) userdata;
-
-    for (int i = 0; i < MAX_PUMPS_PER_TURN; i++) {
-        // Cleared before the pump, not after: CEF calls OnScheduleMessagePumpWork
-        // from inside CefDoMessageLoopWork, and a request for a *later* pump has
-        // to be able to queue itself rather than being coalesced into this one.
-        pthread_mutex_lock(&plugin.pump_mutex);
-        plugin.pump_scheduled = false;
-        pthread_mutex_unlock(&plugin.pump_mutex);
-
-        plugin.want_immediate = false;
-        plugin.in_pump = true;
-        TRACE2("pump %d: enter\n", i);
-        wvcef_do_message_loop_work();
-        TRACE2("pump %d: left\n", i);
-        plugin.in_pump = false;
-
-        if (!plugin.want_immediate) {
-            break;
-        }
-    }
-
-    pthread_mutex_lock(&plugin.pump_mutex);
-    rearm = !plugin.pump_scheduled;
-    pthread_mutex_unlock(&plugin.pump_mutex);
-
-    // Every turn ends with something scheduled, or the loop has nowhere to
-    // continue from and the page quietly stops painting while still looking
-    // alive. Only while a browser could still paint, though -- an app that closed
-    // its webviews shouldn't keep a timer running. See pump_max_delay_ms.
-    if (rearm && wvcef_n_live_browsers() > 0) {
-        on_schedule_pump_work(NULL, plugin.pump_max_delay_ms);
-    }
-
-    return 0;
-}
-
-/// MAY BE CALLED FROM ANY THREAD.
-static void on_schedule_pump_work(void *userdata, int64_t delay_ms) {
-    uint64_t deadline_us;
-    int ok;
-
-    (void) userdata;
-
-    if (delay_ms < 0) {
-        delay_ms = 0;
-    } else if (delay_ms > plugin.pump_max_delay_ms) {
-        delay_ms = plugin.pump_max_delay_ms;
-    }
-
-    // "More work, now" raised from inside the pump is answered by the drain loop
-    // in on_pump_message_loop rather than by queueing a task, so a backlog costs
-    // one event loop turn instead of one turn per item.
-    //
-    // The thread check is not redundant with in_pump: this is called from other
-    // threads too, and in_pump and want_immediate belong to the pumping thread. A
-    // request from elsewhere that took this path would both race on them and be
-    // lost, since the drain loop may already have read the flag.
-    if (delay_ms == 0 && plugin.in_pump && plugin.cef_ui_thread_valid && pthread_equal(pthread_self(), plugin.cef_ui_thread)) {
-        plugin.want_immediate = true;
-        return;
-    }
-
-    deadline_us = now_monotonic_us() + (uint64_t) delay_ms * 1000ull;
-
-    pthread_mutex_lock(&plugin.pump_mutex);
-    if (plugin.pump_scheduled && plugin.pump_deadline_us <= deadline_us) {
-        // A pump is already queued that runs no later than this one wants.
-        pthread_mutex_unlock(&plugin.pump_mutex);
-        return;
-    }
-    plugin.pump_scheduled = true;
-    plugin.pump_deadline_us = deadline_us;
-    pthread_mutex_unlock(&plugin.pump_mutex);
-
-    ok = flutterpi_post_platform_task_with_time(on_pump_message_loop, NULL, deadline_us);
-    if (ok != 0) {
-        LOG_ERROR("Could not schedule CEF message pump work: %s\n", strerror(ok));
-
-        pthread_mutex_lock(&plugin.pump_mutex);
-        plugin.pump_scheduled = false;
-        pthread_mutex_unlock(&plugin.pump_mutex);
-    }
-}
-
-static void pump_soon(void) {
-    on_schedule_pump_work(NULL, 0);
+    pthread_mutex_unlock(&plugin.gl_mutex);
 }
 
 // ---------------------------------------------------------------------------
@@ -508,6 +374,11 @@ static const void *swizzle_bgra_to_rgba(struct webview *wv, const void *buffer, 
     return dst;
 }
 
+/// A frame from CEF, on CEF's UI thread.
+///
+/// Everything from here to texture_push_frame runs under gl_mutex: the platform
+/// thread may be releasing this very webview's textures, and the plugin's EGL
+/// context can only be current on one thread at a time.
 static void on_paint(void *userdata, const void *buffer, int width, int height) {
     struct webview *wv;
     const void *pixels;
@@ -535,8 +406,11 @@ static void on_paint(void *userdata, const void *buffer, int width, int height) 
         }
     }
 
+    pthread_mutex_lock(&plugin.gl_mutex);
+
     // Closed while a frame was in flight.
     if (wv->texture == NULL || width <= 0 || height <= 0) {
+        pthread_mutex_unlock(&plugin.gl_mutex);
         return;
     }
 
@@ -548,6 +422,7 @@ static void on_paint(void *userdata, const void *buffer, int width, int height) 
         pixels = swizzle_bgra_to_rgba(wv, buffer, width, height);
         if (pixels == NULL) {
             LOG_ERROR("Out of memory while converting a webview frame.\n");
+            pthread_mutex_unlock(&plugin.gl_mutex);
             return;
         }
     }
@@ -557,6 +432,7 @@ static void on_paint(void *userdata, const void *buffer, int width, int height) 
     egl_ok = eglMakeCurrent(plugin.egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, plugin.egl_context);
     if (egl_ok == EGL_FALSE) {
         LOG_ERROR("Could not make the webview EGL context current. eglMakeCurrent: 0x%04X\n", eglGetError());
+        pthread_mutex_unlock(&plugin.gl_mutex);
         return;
     }
 
@@ -620,6 +496,7 @@ clear_context:
     eglMakeCurrent(plugin.egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
 
     if (!uploaded) {
+        pthread_mutex_unlock(&plugin.gl_mutex);
         return;
     }
 
@@ -639,6 +516,8 @@ clear_context:
             .userdata = NULL,
         }
     );
+
+    pthread_mutex_unlock(&plugin.gl_mutex);
 }
 
 // ---------------------------------------------------------------------------
@@ -746,11 +625,10 @@ static void on_console_message(void *userdata, int level, const char *message, c
     send_event(wv->browser_id, "onConsoleMessage", keys, values, 4);
 }
 
-/// The browser is really gone now, so the webview can be freed.
-static void on_browser_closed(void *userdata) {
+/// The browser is really gone now, so the webview can be freed. Runs on the
+/// platform thread, posted by on_browser_closed.
+static int on_browser_closed_on_platform(void *userdata) {
     struct webview *wv = userdata;
-
-    wv->browser = NULL;
 
     if (!wv->closing) {
         // CEF closed the browser on its own -- a crashed renderer, most likely.
@@ -758,10 +636,29 @@ static void on_browser_closed(void *userdata) {
         // holds a controller for it and would only get a black rectangle
         // otherwise.
         LOG_ERROR("Webview %d was closed by CEF.\n", wv->browser_id);
-        return;
+        return 0;
     }
 
     webview_free(wv);
+    return 0;
+}
+
+/// CEF's UI thread, from inside the browser's own teardown. The webview list
+/// belongs to the platform thread, so the actual work goes over there -- and
+/// the handle must not be touched again either way, so drop it here.
+static void on_browser_closed(void *userdata) {
+    struct webview *wv = userdata;
+    int ok;
+
+    wv->browser = NULL;
+
+    ok = flutterpi_post_platform_task(on_browser_closed_on_platform, wv);
+    if (ok != 0) {
+        // Nothing sane left to do: freeing it here would race the platform
+        // thread, so leak it and say so.
+        LOG_ERROR("Could not post webview teardown to the platform thread: %s
+", strerror(ok));
+    }
 }
 
 static const struct wvcef_host_callbacks host_callbacks = {
@@ -856,8 +753,6 @@ static int ensure_cef_initialized(const char *user_agent) {
 
     options.switches = switches;
     options.n_switches = n_switches;
-    options.schedule_pump = on_schedule_pump_work;
-    options.schedule_pump_userdata = NULL;
 
     LOG_DEBUG("Initializing CEF. runtime dir: %s, helper: %s\n", runtime_dir, options.subprocess_path);
 
@@ -869,12 +764,6 @@ static int ensure_cef_initialized(const char *user_agent) {
         return ok;
     }
 
-    // CEF was initialized on this thread, so this is its UI thread for the rest
-    // of the process's life. on_schedule_pump_work needs to know.
-    plugin.cef_ui_thread = pthread_self();
-    plugin.cef_ui_thread_valid = true;
-
-    pump_soon();
     return 0;
 }
 
@@ -959,7 +848,6 @@ static int on_create(struct std_value *args, FlutterPlatformMessageResponseHandl
 
     TRACE("created: browser %d, texture %" PRId64 ", url %s\n", wv->browser_id, wv->texture_id, url != NULL ? url : "about:blank");
 
-    pump_soon();
 
     return platch_respond_success_std(
         response_handle,
@@ -1024,7 +912,6 @@ static int on_close(struct std_value *args, FlutterPlatformMessageResponseHandle
     if (wv->browser != NULL) {
         // `wv` is freed in on_browser_closed.
         wvcef_browser_close(wv->browser);
-        pump_soon();
     } else {
         webview_free(wv);
     }
@@ -1048,7 +935,6 @@ static int on_load_url(struct std_value *args, FlutterPlatformMessageResponseHan
     }
 
     wvcef_browser_load_url(wv->browser, url);
-    pump_soon();
 
     return platch_respond_success_std(response_handle, &STDNULL);
 }
@@ -1084,7 +970,6 @@ static int on_set_size(struct std_value *args, FlutterPlatformMessageResponseHan
     );
 
     wvcef_browser_resize(wv->browser, wv->logical_width, wv->logical_height, wv->pixel_ratio);
-    pump_soon();
 
     return platch_respond_success_std(response_handle, &STDNULL);
 }
@@ -1115,7 +1000,6 @@ static int on_cursor_event(const char *method, struct std_value *args, FlutterPl
         wvcef_browser_send_mouse_click(wv->browser, (int) x, (int) y, true);
     }
 
-    pump_soon();
     return platch_respond_success_std(response_handle, &STDNULL);
 }
 
@@ -1134,7 +1018,6 @@ static int on_set_scroll_delta(struct std_value *args, FlutterPlatformMessageRes
     }
 
     wvcef_browser_send_mouse_wheel(wv->browser, (int) x, (int) y, (int) delta_x, (int) delta_y);
-    pump_soon();
 
     return platch_respond_success_std(response_handle, &STDNULL);
 }
@@ -1152,7 +1035,6 @@ static int on_set_client_focus(struct std_value *args, FlutterPlatformMessageRes
     arg_bool_at(args, 1, &focused);
 
     wvcef_browser_set_focus(wv->browser, focused);
-    pump_soon();
 
     return platch_respond_success_std(response_handle, &STDNULL);
 }
@@ -1181,7 +1063,6 @@ static int on_ime_text(const char *method, struct std_value *args, FlutterPlatfo
         wvcef_browser_ime_set_composition(wv->browser, text);
     }
 
-    pump_soon();
     return platch_respond_success_std(response_handle, &STDNULL);
 }
 
@@ -1201,7 +1082,6 @@ static int on_execute_javascript(struct std_value *args, FlutterPlatformMessageR
     }
 
     wvcef_browser_execute_javascript(wv->browser, code);
-    pump_soon();
 
     return platch_respond_success_std(response_handle, &STDNULL);
 }
@@ -1223,7 +1103,6 @@ static int on_navigation(const char *method, struct std_value *args, FlutterPlat
         wvcef_browser_go_forward(wv->browser);
     }
 
-    pump_soon();
     return platch_respond_success_std(response_handle, &STDNULL);
 }
 
@@ -1248,7 +1127,6 @@ static int on_quit(FlutterPlatformMessageResponseHandle *response_handle) {
         }
     }
 
-    pump_soon();
     return platch_respond_success_std(response_handle, &STDNULL);
 }
 
@@ -1337,7 +1215,6 @@ enum plugin_init_result webview_cef_init(struct flutterpi *flutterpi, void **use
     // Any value means on; a number picks the level. Spelling it this way keeps
     // FLUTTERPI_CEF_TRACE=1 and a bare FLUTTERPI_CEF_TRACE= both meaning "trace".
     plugin.trace_level = getenv("FLUTTERPI_CEF_TRACE") == NULL ? 0 : (int) resolve_env_long("FLUTTERPI_CEF_TRACE", 1);
-    plugin.pump_max_delay_ms = 1000 / resolve_frame_rate();
 
     // The BGRA path uploads with GL_BGRA_EXT as the internal format, but the
     // frame is handed to the engine as GL_RGBA8_OES, which is what every other
@@ -1354,12 +1231,12 @@ enum plugin_init_result webview_cef_init(struct flutterpi *flutterpi, void **use
         LOG_ERROR("GL_EXT_texture_format_BGRA8888 is missing; webview frames will be converted on the CPU, which is slow.\n");
     }
 
-    pthread_mutex_init(&plugin.pump_mutex, NULL);
+    pthread_mutex_init(&plugin.gl_mutex, NULL);
 
     ok = plugin_registry_set_receiver_locked(WEBVIEW_CEF_CHANNEL, kStandardMethodCall, on_receive);
     if (ok != 0) {
         LOG_ERROR("Could not set the webview platform channel receiver: %s\n", strerror(ok));
-        pthread_mutex_destroy(&plugin.pump_mutex);
+        pthread_mutex_destroy(&plugin.gl_mutex);
         eglDestroyContext(display, context);
         return PLUGIN_INIT_RESULT_ERROR;
     }
@@ -1407,14 +1284,9 @@ void webview_cef_deinit(struct flutterpi *flutterpi, void *userdata) {
     }
 
     if (wvcef_is_initialized()) {
+        // CEF closes browsers on its own thread, so this only has to wait.
         // 200 * 10ms = 2s worth of patience.
         for (int i = 0; i < 200 && wvcef_n_live_browsers() > 0; i++) {
-            wvcef_do_message_loop_work();
-
-            if (wvcef_n_live_browsers() == 0) {
-                break;
-            }
-
             nanosleep(&(struct timespec){ .tv_sec = 0, .tv_nsec = 10 * 1000 * 1000 }, NULL);
         }
 
@@ -1439,7 +1311,7 @@ void webview_cef_deinit(struct flutterpi *flutterpi, void *userdata) {
         plugin.egl_context = EGL_NO_CONTEXT;
     }
 
-    pthread_mutex_destroy(&plugin.pump_mutex);
+    pthread_mutex_destroy(&plugin.gl_mutex);
 }
 
 FLUTTERPI_PLUGIN("webview_cef", webview_cef_plugin, webview_cef_init, webview_cef_deinit)

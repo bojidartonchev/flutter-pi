@@ -11,21 +11,27 @@
 
 #include "cef_bridge.h"
 
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <functional>
+#include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
 #include "include/cef_app.h"
 #include "include/cef_browser.h"
 #include "include/cef_client.h"
+#include "include/cef_task.h"
 #include "include/cef_version.h"
 
-// Written against CEF 132. Two older API differences would otherwise surface as
-// confusing "marked override but does not override" errors, so fail loudly
-// instead: CEF 120 renamed the int64 typedef used by OnScheduleMessagePumpWork,
-// and CEF 126 added the popup_id parameter to OnBeforePopup.
+// Written against CEF 132. CEF 126 added the popup_id parameter to OnBeforePopup,
+// which would otherwise surface as a confusing "marked override but does not
+// override" error, so fail loudly instead.
 #if CEF_VERSION_MAJOR < 126
     #error "The webview_cef plugin requires CEF 126 or newer."
 #endif
@@ -34,16 +40,34 @@
 
 namespace {
 
+/// Runs a closure on a CEF thread. Written against CefTask directly rather than
+/// base::BindOnce so it depends only on cef_task.h.
+class FnTask : public CefTask {
+public:
+    explicit FnTask(std::function<void()> fn) : fn_(std::move(fn)) {}
+
+    FnTask(const FnTask &) = delete;
+    FnTask &operator=(const FnTask &) = delete;
+
+    void Execute() override { fn_(); }
+
+private:
+    std::function<void()> fn_;
+
+    IMPLEMENT_REFCOUNTING(FnTask);
+};
+
+void post_to_ui(std::function<void()> fn) {
+    CefPostTask(TID_UI, CefRefPtr<CefTask>(new FnTask(std::move(fn))));
+}
+
 // ---------------------------------------------------------------------------
 // CefApp -- one per process.
 // ---------------------------------------------------------------------------
 
 class WebviewApp : public CefApp, public CefBrowserProcessHandler {
 public:
-    WebviewApp(std::vector<std::string> switches, wvcef_schedule_pump_cb schedule_pump, void *schedule_pump_userdata) :
-        switches_(std::move(switches)),
-        schedule_pump_(schedule_pump),
-        schedule_pump_userdata_(schedule_pump_userdata) {}
+    explicit WebviewApp(std::vector<std::string> switches) : switches_(std::move(switches)) {}
 
     WebviewApp(const WebviewApp &) = delete;
     WebviewApp &operator=(const WebviewApp &) = delete;
@@ -67,17 +91,8 @@ public:
         }
     }
 
-    // MAY BE CALLED FROM ANY THREAD.
-    void OnScheduleMessagePumpWork(int64_t delay_ms) override {
-        if (schedule_pump_ != nullptr) {
-            schedule_pump_(schedule_pump_userdata_, delay_ms);
-        }
-    }
-
 private:
     std::vector<std::string> switches_;
-    wvcef_schedule_pump_cb schedule_pump_;
-    void *schedule_pump_userdata_;
 
     IMPLEMENT_REFCOUNTING(WebviewApp);
 };
@@ -476,7 +491,11 @@ private:
 };
 
 bool g_initialized = false;
-int g_n_live_browsers = 0;
+
+/// Incremented on whichever thread creates a browser, decremented on CEF's UI
+/// thread when one closes, read from both.
+std::atomic<int> g_n_live_browsers{ 0 };
+
 CefRefPtr<WebviewApp> g_app;
 
 cef_log_severity_t to_log_severity(int severity) {
@@ -506,36 +525,26 @@ struct wvcef_browser {
 
 namespace {
 
-/// Handles whose browser has closed, waiting to be freed from a stack that isn't
-/// inside one of their own CEF callbacks.
-std::vector<struct wvcef_browser *> g_zombies;
-
+/// Called on CEF's UI thread, from inside the client's own OnBeforeClose.
 void on_client_gone(void *userdata) {
     struct wvcef_browser *handle = static_cast<struct wvcef_browser *>(userdata);
 
-    if (g_n_live_browsers > 0) {
+    if (g_n_live_browsers.load() > 0) {
         g_n_live_browsers--;
     }
 
-    if (handle != nullptr) {
-        g_zombies.push_back(handle);
-    }
-}
-
-/// Releases closed browsers. Only safe to call from outside any CEF callback,
-/// because dropping the handle's CefRefPtr may destroy the client object.
-void reap_zombies() {
-    if (g_zombies.empty()) {
+    if (handle == nullptr) {
         return;
     }
 
-    std::vector<struct wvcef_browser *> zombies;
-    zombies.swap(g_zombies);
-
-    for (struct wvcef_browser *handle : zombies) {
+    // Not freed here: dropping the handle's CefRefPtr may destroy the very client
+    // object whose callback is on the stack. A UI thread task runs after this
+    // returns, and after anything already queued that might still name the
+    // handle, so it is the natural place to let go.
+    post_to_ui([handle]() {
         handle->client = nullptr;
         delete handle;
-    }
+    });
 }
 
 CefRefPtr<CefBrowser> browser_of(struct wvcef_browser *browser) {
@@ -573,7 +582,7 @@ int wvcef_initialize(const struct wvcef_init_options *options) {
         }
     }
 
-    g_app = new WebviewApp(std::move(switches), options->schedule_pump, options->schedule_pump_userdata);
+    g_app = new WebviewApp(std::move(switches));
 
     // Don't hand flutter-pi's own argv to Chromium -- it would try to interpret
     // "--release" and the asset bundle path as Chromium switches. Everything we
@@ -585,8 +594,21 @@ int wvcef_initialize(const struct wvcef_init_options *options) {
     CefSettings settings;
     settings.no_sandbox = 1;
     settings.windowless_rendering_enabled = 1;
-    settings.external_message_pump = 1;
-    settings.multi_threaded_message_loop = 0;
+
+    // CEF gets its own thread for the browser process message loop.
+    //
+    // The alternative, external_message_pump, lets the host drive the loop from
+    // its own event loop and makes the host thread CEF's UI thread -- which is
+    // tempting, because then every callback can touch host state with no locks.
+    // But a Chromium task on the UI thread will sometimes block waiting for more
+    // UI thread work, and only a real message loop can nest and deliver it; an
+    // external pump is stuck inside its one CefDoMessageLoopWork() call. When that
+    // happens the process stops for good with the page still looking alive. It is
+    // not a corner case -- a WebGL page reached it within seconds -- and CEF's own
+    // documentation recommends against the option for exactly this sort of reason.
+    settings.external_message_pump = 0;
+    settings.multi_threaded_message_loop = 1;
+
     settings.command_line_args_disabled = 0;
     settings.log_severity = to_log_severity(options->log_severity);
 
@@ -624,17 +646,8 @@ bool wvcef_is_initialized(void) {
     return g_initialized;
 }
 
-void wvcef_do_message_loop_work(void) {
-    if (!g_initialized) {
-        return;
-    }
-
-    reap_zombies();
-    CefDoMessageLoopWork();
-}
-
 int wvcef_n_live_browsers(void) {
-    return g_n_live_browsers;
+    return g_n_live_browsers.load();
 }
 
 void wvcef_shutdown(void) {
@@ -642,9 +655,10 @@ void wvcef_shutdown(void) {
         return;
     }
 
-    reap_zombies();
-
     g_initialized = false;
+
+    // Stops CEF's message loop thread and joins it, so any handle-freeing task
+    // still queued on the UI thread has run by the time this returns.
     CefShutdown();
     g_app = nullptr;
 }
@@ -682,27 +696,60 @@ struct wvcef_browser *wvcef_browser_create(
     handle->client = new WebviewClient(width, height, device_pixel_ratio, callbacks, userdata);
     handle->client->set_on_gone(on_client_gone, handle);
 
-    CefWindowInfo window_info;
-    window_info.SetAsWindowless(0);
+    const std::string target = (url != nullptr && url[0] != '\0') ? url : "about:blank";
 
-    CefBrowserSettings browser_settings;
-    browser_settings.windowless_frame_rate = frame_rate;
-    browser_settings.background_color = CefColorSetARGB(255, 255, 255, 255);
+    // CreateBrowserSync is the one CEF call in this file that insists on the UI
+    // thread -- everything else is documented as callable from any browser process
+    // thread -- so it is posted there and this thread waits for the answer. The
+    // caller needs the browser id to answer the channel call that asked for a
+    // webview, and there is no id until the browser exists.
+    //
+    // Shared state on the heap, not captured by reference: on the timeout path
+    // this function returns while the task may still be queued, and a task writing
+    // into a stack frame that has gone away is a far worse problem than the one
+    // the timeout is protecting against.
+    struct create_state {
+        std::mutex lock;
+        std::condition_variable cv;
+        bool done = false;
+        bool created = false;
+    };
+    auto state = std::make_shared<create_state>();
 
-    CefRefPtr<CefBrowser> browser = CefBrowserHost::CreateBrowserSync(
-        window_info,
-        handle->client,
-        CefString(url != nullptr && url[0] != '\0' ? url : "about:blank"),
-        browser_settings,
-        nullptr,
-        nullptr
-    );
-    if (browser == nullptr) {
-        LOG_CEF("CefBrowserHost::CreateBrowserSync failed.\n");
-        handle->client->set_on_gone(nullptr, nullptr);
-        handle->client = nullptr;
-        delete handle;
-        return nullptr;
+    post_to_ui([state, handle, target, frame_rate]() {
+        CefWindowInfo window_info;
+        window_info.SetAsWindowless(0);
+
+        CefBrowserSettings browser_settings;
+        browser_settings.windowless_frame_rate = frame_rate;
+        browser_settings.background_color = CefColorSetARGB(255, 255, 255, 255);
+
+        const bool ok =
+            CefBrowserHost::CreateBrowserSync(window_info, handle->client, CefString(target), browser_settings, nullptr, nullptr) !=
+            nullptr;
+
+        std::lock_guard<std::mutex> guard(state->lock);
+        state->created = ok;
+        state->done = true;
+        state->cv.notify_one();
+    });
+
+    {
+        std::unique_lock<std::mutex> guard(state->lock);
+        if (!state->cv.wait_for(guard, std::chrono::seconds(15), [&state]() { return state->done; })) {
+            LOG_CEF("Timed out waiting for CEF's UI thread to create a browser.\n");
+            // The task may still run and use `handle`, so it can't be freed here.
+            // One leaked handle is the lesser evil.
+            return nullptr;
+        }
+
+        if (!state->created) {
+            LOG_CEF("CefBrowserHost::CreateBrowserSync failed.\n");
+            handle->client->set_on_gone(nullptr, nullptr);
+            handle->client = nullptr;
+            delete handle;
+            return nullptr;
+        }
     }
 
     g_n_live_browsers++;

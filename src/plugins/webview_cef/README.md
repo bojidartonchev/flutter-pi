@@ -31,44 +31,46 @@ cannot be given a window of its own. Instead:
 
 ### Threading
 
-CEF is initialized with `external_message_pump`, on flutter-pi's platform
-thread. That makes the platform thread CEF's *UI thread*, which means every CEF
-callback -- including `OnPaint` -- lands on the platform thread and can touch
-flutter-pi state directly. No locks, no marshalling.
+CEF runs the browser process message loop on a thread of its own
+(`multi_threaded_message_loop`), so CEF's *UI thread* is not flutter-pi's platform
+thread. Two threads therefore meet in the plugin:
 
-The pump itself is driven from flutter-pi's `sd_event` loop:
-`OnScheduleMessagePumpWork(delay_ms)` posts a delayed platform task that calls
-`CefDoMessageLoopWork()`. That callback is the one thing CEF may invoke from
-another thread, so it is the only place with a mutex.
+- platform channel handlers run on the platform thread,
+- every `cef_bridge` callback -- `OnPaint` included -- runs on CEF's UI thread.
 
-Honouring that callback is not enough on its own. It is a request for a pump, not
-a promise that CEF will ask again, so a pump driven purely by requests can run
-out of them and stop -- and then CEF's UI thread is stopped for good. The failure
-is a confusing one, because nothing looks broken: the network stack and the
-render processes are on other threads and in other processes, so a page still
-loads and its JavaScript still runs. It simply never paints again after whatever
-frame was already in flight, until an unrelated event (a mouse move, a resize)
-happens to schedule a pump and one more frame slips out.
+Three rules keep that honest. The webview list belongs to the platform thread, so
+`OnBeforeClose` posts its teardown there rather than unlinking anything itself.
+Everything a frame touches on its way to a texture is behind one mutex, because
+the platform thread may be releasing the same webview's textures and the plugin's
+EGL context can only be current on one thread at a time. And sending a platform
+message needs nothing at all: `flutterpi_send_platform_message` posts to the
+platform thread when it isn't already on it.
 
-So the pump also keeps its own heartbeat, at the configured
-`windowless_frame_rate`, for as long as a browser exists that could paint, and
-clamps requested delays to the same interval. CEF's reference implementation
-(`MainMessageLoopExternalPump` in cefclient) clamps its timer for the same
-reason.
+Only one CEF call has to be marshalled. `CefBrowser` and `CefBrowserHost` are
+documented as callable from any browser process thread, which covers input,
+resize, navigation and close; `CreateBrowserSync` is the exception, so the bridge
+posts it to the UI thread and waits for the browser id the channel reply needs.
 
-A request for *immediate* work is answered immediately, on the spot, rather than
-by queueing a task -- again following cefclient. Routing immediate work through
-the event loop caps how fast CEF's UI thread can drain its queue at one iteration
-per loop turn, which is invisible on a static page and crippling on one that
-makes hundreds of requests: everything still works, just slowly enough that
-page-side timeouts start firing.
+### Why not the external message pump
 
-Both paths end by making sure something will pump again. That is not a detail: a
-synchronous pump never touches the queue, so if CEF wants nothing at that instant
-the loop has nowhere to continue from, and the pump is simply over. The symptom
-is a webview that sometimes never loads at all and sometimes stops partway,
-depending on what CEF happened to have queued -- and the page looks alive
-throughout, because its own process is still running fine.
+`external_message_pump` is the other way to do this, and it looks strictly nicer:
+the host drives `CefDoMessageLoopWork()` from its own event loop, the platform
+thread *becomes* CEF's UI thread, and every callback can touch flutter-pi state
+with no locks and no marshalling at all.
+
+It also deadlocks. A Chromium task on the UI thread will sometimes block waiting
+for more UI thread work -- something in the GPU and compositor paths does it
+regularly. A real message loop nests and delivers that work; an external pump
+cannot, because the host is stuck inside its one `CefDoMessageLoopWork()` call
+and has no way to re-enter it. The process then stops for good.
+
+It is worth knowing what that looks like, because none of it points at the pump.
+Everything off the UI thread keeps running -- the network stack, the render
+process -- so the page stays loaded, its JavaScript still runs and its WebSocket
+stays up; it just never paints again. How long it survives depends only on how
+often the blocking path is hit: with software WebGL it lasted about 130 frames,
+with hardware GL about 1600, and with a page that painted but did nothing else it
+looked fine indefinitely. CEF's own documentation recommends against the option.
 
 ### Processes
 
