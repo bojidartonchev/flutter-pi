@@ -79,8 +79,22 @@
 /// explain on a release image, in place, without a rebuild.
 #define TRACE(...)                                         \
     do {                                                   \
-        if (plugin.trace) {                                \
+        if (plugin.trace_level >= 1) {                     \
             fprintf(stderr, "[webview_cef] " __VA_ARGS__); \
+        }                                                  \
+    } while (0)
+
+/// FLUTTERPI_CEF_TRACE=2: every frame, step by step, unbuffered.
+///
+/// This exists to find out where the platform thread stopped, on a device with no
+/// debugger and no package feed to put one on. Both things it steps through -- the
+/// CEF message loop and the GL upload -- can block, and the difference matters:
+/// the last line printed names the call that didn't come back.
+#define TRACE2(...)                                        \
+    do {                                                   \
+        if (plugin.trace_level >= 2) {                     \
+            fprintf(stderr, "[webview_cef] " __VA_ARGS__); \
+            fflush(stderr);                                \
         }                                                  \
     } while (0)
 
@@ -144,8 +158,8 @@ struct webview_cef_plugin {
     EGLContext egl_context;
     bool supports_bgra;
 
-    /// FLUTTERPI_CEF_TRACE is set; see TRACE above.
-    bool trace;
+    /// FLUTTERPI_CEF_TRACE; see TRACE and TRACE2 above.
+    int trace_level;
 
     /// The thread CEF was initialized on, which is therefore its UI thread. Only
     /// meaningful once CEF is up.
@@ -374,7 +388,9 @@ static int on_pump_message_loop(void *userdata) {
 
         plugin.want_immediate = false;
         plugin.in_pump = true;
+        TRACE2("pump %d: enter\n", i);
         wvcef_do_message_loop_work();
+        TRACE2("pump %d: left\n", i);
         plugin.in_pump = false;
 
         if (!plugin.want_immediate) {
@@ -501,10 +517,11 @@ static void on_paint(void *userdata, const void *buffer, int width, int height) 
 
     wv = userdata;
 
-    if (plugin.trace) {
+    wv->n_frames++;
+
+    {
         // The first frames are what you want to see; after that a heartbeat is
         // enough, since 30fps of this would drown out everything else.
-        wv->n_frames++;
         if (wv->n_frames <= 3 || wv->n_frames % 100 == 0) {
             TRACE(
                 "paint %" PRIu64 ": browser %d, %dx%d px, texture %" PRId64 "%s\n",
@@ -535,11 +552,15 @@ static void on_paint(void *userdata, const void *buffer, int width, int height) 
         }
     }
 
+    TRACE2("paint %" PRIu64 ": making context current\n", wv->n_frames);
+
     egl_ok = eglMakeCurrent(plugin.egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, plugin.egl_context);
     if (egl_ok == EGL_FALSE) {
         LOG_ERROR("Could not make the webview EGL context current. eglMakeCurrent: 0x%04X\n", eglGetError());
         return;
     }
+
+    TRACE2("paint %" PRIu64 ": context current, uploading %dx%d\n", wv->n_frames, width, height);
 
     if (wv->gl_texture == 0) {
         glGenTextures(1, &wv->gl_texture);
@@ -590,7 +611,9 @@ static void on_paint(void *userdata, const void *buffer, int width, int height) 
     // hand the frame over. glFlush() is the minimum the GLES spec asks for, but
     // in practice only glFinish() is reliable across drivers. If this ever shows
     // up in a profile, an EGL fence sync is the way to relax it.
+    TRACE2("paint %" PRIu64 ": uploaded, glFinish\n", wv->n_frames);
     glFinish();
+    TRACE2("paint %" PRIu64 ": glFinish returned\n", wv->n_frames);
     uploaded = true;
 
 clear_context:
@@ -599,6 +622,8 @@ clear_context:
     if (!uploaded) {
         return;
     }
+
+    TRACE2("paint %" PRIu64 ": pushing frame\n", wv->n_frames);
 
     texture_push_frame(
         wv->texture,
@@ -1309,7 +1334,9 @@ enum plugin_init_result webview_cef_init(struct flutterpi *flutterpi, void **use
     plugin.flutterpi = flutterpi;
     plugin.egl_display = display;
     plugin.egl_context = context;
-    plugin.trace = getenv("FLUTTERPI_CEF_TRACE") != NULL;
+    // Any value means on; a number picks the level. Spelling it this way keeps
+    // FLUTTERPI_CEF_TRACE=1 and a bare FLUTTERPI_CEF_TRACE= both meaning "trace".
+    plugin.trace_level = getenv("FLUTTERPI_CEF_TRACE") == NULL ? 0 : (int) resolve_env_long("FLUTTERPI_CEF_TRACE", 1);
     plugin.pump_max_delay_ms = 1000 / resolve_frame_rate();
 
     // The BGRA path uploads with GL_BGRA_EXT as the internal format, but the

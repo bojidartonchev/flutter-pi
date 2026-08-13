@@ -132,13 +132,18 @@ up, since none of it needs a recompile.
 | `FLUTTERPI_CEF_LOG_SEVERITY` | 1 verbose, 2 info, 3 warning, 4 error, 5 fatal, 99 off |
 | `FLUTTERPI_CEF_FRAME_RATE` | `windowless_frame_rate`, 1..60 (default 30) |
 | `FLUTTERPI_CEF_EAGER_INIT` | if set, start CEF during plugin init instead of on the first `init`/`create` |
-| `FLUTTERPI_CEF_TRACE` | if set, log browser creation, `setSize` and the frames arriving from CEF |
+| `FLUTTERPI_CEF_TRACE` | `1` logs browser creation, `setSize` and the frames arriving from CEF; `2` adds every frame step by step |
 | `FLUTTERPI_CEF_FORCE_RGBA` | if set, convert frames to RGBA on the CPU instead of uploading BGRA directly |
 
-`FLUTTERPI_CEF_TRACE` answers the first question a blank webview raises: is CEF
+`FLUTTERPI_CEF_TRACE=1` answers the first question a blank webview raises: is CEF
 painting at all, and at what size? It prints the first three frames per browser
 and then every hundredth, so it is usable on a running release build -- unlike
 `LOG_DEBUG`, which is compiled out of exactly the builds that need explaining.
+
+Level `2` prints each frame's steps, flushed as it goes, for the case where the
+platform thread stops dead: both the CEF message loop and the GL upload can
+block, and the last line printed says which call didn't return. Useful on a
+target with no debugger on it.
 
 `FLUTTERPI_CEF_EAGER_INIT` exists because plugins are initialized *before* the
 flutter engine is created. Starting CEF there means Chromium forks its helper
