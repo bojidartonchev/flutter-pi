@@ -28,3 +28,14 @@ if (BUILD_WEBVIEW_CEF_PLUGIN)
     # the C++ runtime.
     set_target_properties(platformchannel_test flutterpi_test PROPERTIES LINKER_LANGUAGE CXX)
 endif()
+# This test includes modesetting.c with a mocked DRM submission boundary.
+add_executable(kms_present_test kms_present_test.c)
+target_include_directories(kms_present_test PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_SOURCE_DIR}/third_party/flutter_embedder_header/include
+    ${CMAKE_BINARY_DIR}
+)
+target_compile_options(kms_present_test PRIVATE -UNDEBUG -ffunction-sections -fdata-sections)
+target_link_options(kms_present_test PRIVATE -Wl,--gc-sections)
+target_link_libraries(kms_present_test PRIVATE PkgConfig::DRM PkgConfig::GBM Threads::Threads m)
+add_test(kms_present_test kms_present_test)
